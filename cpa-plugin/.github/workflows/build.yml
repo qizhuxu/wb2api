@@ -1,0 +1,125 @@
+# Build CPA plugin — 仅构建 amd64 (.so) 并发布
+#
+# arm64 的 .so 需要原生 arm64 C 工具链编译 c-shared，
+# ubuntu-24.04-arm runner 缺少完整的 C 编译器工具链，
+# 且你服务器是 x86_64，只需要 amd64 版本。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号"
+        required: false
+        default: "0.9.0"
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_ID: workbuddy
+  PLUGIN_NAME: "WorkBuddy"
+
+jobs:
+  build:
+    name: build linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Install C compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc libc6-dev
+
+      - name: Test
+        run: CGO_ENABLED=0 go test ./... -count=1
+
+      # The plugin store reads the registry from the repository, so a bad value
+      # here breaks installation for everyone. A placeholder sha256 is the worst
+      # case: the store rejects it outright with "invalid sha256 length", which
+      # is what happened when "PENDING" was committed as a stand-in.
+      - name: Validate registry.json
+        run: python3 scripts/validate_registry.py
+
+      - name: Build .so (c-shared)
+        env: {CGO_ENABLED: "1", CC: gcc, GOOS: linux, GOARCH: amd64}
+        run: |
+          mkdir -p dist
+          go build -buildmode=c-shared -trimpath -o dist/workbuddy.so .
+          readelf -h dist/workbuddy.so | grep Machine
+          nm -D --defined-only dist/workbuddy.so | grep cliproxy_plugin_init
+          go build -o dist/smoke ./smoke
+          ./dist/smoke dist/workbuddy.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-linux-amd64
+          path: dist/workbuddy.so
+
+  package:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          V="${GITHUB_REF#refs/tags/}"; V="${V#v}"
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Package
+        run: |
+          python3 scripts/build_release.py \
+            --id "${PLUGIN_ID}" \
+            --version "${{ steps.ver.outputs.version }}" \
+            --amd64 dist/workbuddy-linux-amd64/workbuddy.so \
+            --out release
+          python3 scripts/build_release_registry.py \
+            --id "${PLUGIN_ID}" --name "${PLUGIN_NAME}" \
+            --version "${{ steps.ver.outputs.version }}" \
+            --repo "${{ github.server_url }}/${{ github.repository }}" \
+            --tag "v${{ steps.ver.outputs.version }}" \
+            --out registry.json
+
+      # The store validates the archive entry by entry before installing and
+      # rejects anything that is not a single, root-level "<id>.so"
+      # (internal/pluginstore/install.go readTargetLibrary):
+      #
+      #   "target dynamic library must be at zip root"
+      #   "zip contains multiple target dynamic libraries"
+      #
+      # Shipping a tidier directory layout therefore fails at install time on the
+      # user's machine rather than here, so check it now.
+      - name: Verify archive layout
+        run: python3 scripts/verify_archive_layout.py --dir release --version "${{ steps.ver.outputs.version }}"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.zip
+            release/checksums.txt
+            registry.json
+          generate_release_notes: true
+
+      # self-check — warn-only, never block the release
+      - name: Verify
+        id: ver2
+        continue-on-error: true
+        run: |
+          id=$(gh api "repos/${{ github.repository }}/releases/tags/v${{ steps.ver.outputs.version }}" --jq '.id' 2>/dev/null || echo "")
+          if [[ -z "${id}" ]]; then echo "::warning::release not found by tag"; exit 0; fi
+          tagcount=$(gh api "repos/${{ github.repository }}/releases/tags/v${{ steps.ver.outputs.version }}" --jq '.assets | length' 2>/dev/null || echo 0)
+          realcount=$(gh api "repos/${{ github.repository }}/releases/${id}/assets" --jq 'length' 2>/dev/null || echo 0)
+          echo "assets tags-endpoint: ${tagcount}  /assets-endpoint: ${realcount}"
+          [[ "${realcount}" -ge 2 ]] && echo "release OK" || echo "::warning::assets count via id endpoint = ${realcount}"

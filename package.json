@@ -1,0 +1,24 @@
+{
+  "name": "wb2api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把本机 WorkBuddy 的账号会话包成标准 OpenAI 兼容入口（流式 / 非流式），跑在本机。",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node scripts/daemon.mjs start",
+    "stop": "node scripts/daemon.mjs stop",
+    "status": "node scripts/daemon.mjs status",
+    "serve": "node server.mjs",
+    "menu": "node menu.mjs",
+    "creds": "node scripts/creds-cli.mjs",
+    "probe": "node scripts/probe.mjs",
+    "public-snapshot": "node scripts/public-snapshot.mjs",
+    "test": "node test/errors.test.mjs && node test/catalog.test.mjs && node test/reasoning.test.mjs && node test/models.test.mjs && node test/creds.test.mjs && node test/accounts.test.mjs"
+  },
+  "dependencies": {
+    "yaml": "^2.5.0"
+  }
+}

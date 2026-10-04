@@ -1,0 +1,112 @@
+name: docker
+
+# 构建并推送 Node 版镜像到 GitHub Container Registry。
+#
+# 触发：推送 tag（v*）或手动 workflow_dispatch。
+# 产物：ghcr.io/<owner>/<repo>:<tag> 与 :latest
+#
+# 需求背景：本机 Windows 没有 Docker，镜像只能在 CI 上构建 ——
+# 这正是本 workflow 存在的原因。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            # latest 始终指向最近一次构建：smoke job 要按 :latest 拉镜像，
+            # 若只在默认分支打 latest，tag 推送时 smoke 会拉不到。
+            type=raw,value=latest
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 多架构：Linux 服务器与本地 mac 都能用
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 构建完立即做一次冒烟：起容器 → 等健康 → 打自检端点 → 收工。
+  # 凭证不可用也应通过（/health 恒 200），这里只验证「镜像能跑起来」。
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 登录 ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 起容器（无凭证，只验证启动）
+        run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          docker run -d --name wb2api-smoke -p 18788:18788 "$IMAGE:latest"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18788/health >/dev/null 2>&1; then
+              echo "服务已就绪（第 ${i} 次探测）"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: 断言端点可用
+        run: |
+          set -e
+          echo "--- /health ---"
+          curl -fsS http://127.0.0.1:18788/health | head -c 300; echo
+          echo "--- /ui（管理台）---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18788/ui)
+          echo "/ui → HTTP $code"
+          [ "$code" = "200" ] || { echo "管理台不可用"; exit 1; }
+          echo "--- /ui/app.js ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18788/ui/app.js)
+          echo "/ui/app.js → HTTP $code"
+          [ "$code" = "200" ] || { echo "静态资源不可用"; exit 1; }
+
+      - name: 容器日志（失败时排查）
+        if: always()
+        run: docker logs wb2api-smoke || true
+
+      - name: 清理
+        if: always()
+        run: docker rm -f wb2api-smoke || true

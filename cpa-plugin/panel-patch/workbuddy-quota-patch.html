@@ -1,0 +1,604 @@
+<!--
+  WorkBuddy quota patch for CLIProxyAPI Management Center — v1
+
+  WHY THIS EXISTS
+  ---------------
+  The official panel renders provider cards from five hard-coded provider
+  tables baked into its bundle. `codebuddy` (the provider WorkBuddy accounts
+  register under) appears in none of them, and the panel bundle contains the
+  literal strings "codebuddy" / "Codebuddy" / "CodeBuddy" zero times. So:
+
+    #/auth-files  — the card and the filter tab DO appear (both are generated
+                    from the returned data), but two pieces are missing:
+                      · the quota strip   (gated by the `TD` set)
+                      · the "refresh OAuth credential" button (gated by `ND`)
+    #/quota       — no card at all: the page builds its grid from the `VM`
+                    array, and an entry that matches no filterFn is dropped.
+
+  This patch fills exactly those gaps. It never rewrites the panel's data
+  flow — see the SAFETY section.
+
+  SAFETY — why this patch only reads APIs and writes DOM
+  ------------------------------------------------------
+  The official #/quota page has an unguarded index lookup:
+
+      N = useCallback(e => M[e.type][bm(e.file)], [M])
+
+  where M is an object literal keyed by the seven known providers. If a
+  `codebuddy` entry ever reached that list, M['codebuddy'] would be undefined
+  and the whole page would throw. The panel's own GM() filter drops unknown
+  providers silently, so we must NOT inject ours into the panel's state.
+  This patch therefore: reads the management API, writes DOM nodes, and
+  nothing else.
+
+  HARD CONSTRAINTS (each one is a real incident from the sibling mimo patch)
+  -------------------------------------------------------------------------
+   1. The version marker is a STRING. Writing `window.__wbQuotaPatch=1.0.1`
+      is a syntax error (`1.0` then `.1`) that kills the entire script — the
+      cards and buttons vanish and the console shows only "Unexpected number".
+   2. The guard is top-level: `if (window.__wbQuotaPatch) return;` followed by
+      the assignment. The injector's version regex is anchored on that shape,
+      so do not move it inside a function.
+   3. All custom classes are prefixed `wb-` and all marker attributes are
+      `data-wb-*`, so this patch and the mimo patch already present on the
+      target panel cannot collide.
+   4. This comment block must never contain the literal assignment text for
+      the version marker (the injector would match it instead of the real one).
+      It also avoids writing the opening script tag verbatim anywhere in prose,
+      so a comment-stripping injector and a naive one agree on where scripts
+      start.
+   5. Styling comes from the panel's own CSS module classes wherever possible.
+      Nothing here links to an external resource; there is no icon payload.
+
+  WHAT IT DOES
+  ------------
+   · Captures the management key from the panel's own requests (both fetch and
+     XMLHttpRequest — the panel's API client is axios, which uses XHR; hooking
+     only fetch does nothing). The key is held in memory only: never written to
+     storage, never logged.
+   · Gate: if the workbuddy plugin is not effective_enabled, every card is
+     hidden. Without this, a disabled plugin still lists auth files and the
+     panel would show healthy-looking cards for a provider that cannot serve.
+   · #/quota: one card per account, built from the official QuotaCard class
+     names (iconFallback letter, fileName, idleBody "click to refresh"), and
+     it fetches nothing until clicked — matching the official cards' laziness.
+   · #/auth-files: a quota strip inside each workbuddy card plus the
+     "refresh OAuth credential" icon button the official whitelist omits.
+-->
+<style>
+  /* Only what the official stylesheet does not already cover. */
+  [data-wb-hidden='1'] { display: none !important; }
+  .wb-quota-strip { display: flex; flex-direction: column; gap: 6px; padding: 4px 0; }
+  .wb-quota-line { font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-tertiary); }
+  .wb-quota-err { color: var(--text-danger, #c0392b); }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  // Guard inside the IIFE, not at the top level: a bare `return` is illegal in
+  // a classic script and would kill this entire block. The sibling patch
+  // learned this the hard way (its v7.4.1 shipped an illegal version literal
+  // and the whole script silently failed to parse).
+  if (window.__wbQuotaPatch) return;
+  window.__wbQuotaPatch = '1';
+
+  // ---------------------------------------------------------------- config
+
+  var PROVIDER = 'codebuddy';      // the provider/type auth files carry
+  var PLUGIN_ID = 'workbuddy';     // the plugin id (NOT the same string!)
+  var API = '/v0/management';
+  var TICK_MS = 800;
+  var GATE_TTL_MS = 5000;
+
+  // Class names taken from the running panel. The official bundle is a
+  // hashed CSS-module build, so these suffixes can change between releases;
+  // every lookup therefore prefers a live DOM match and falls back to these.
+  var CLS = {
+    quotaGrid: 'QuotaPage-module__grid',
+    quotaCard: 'QuotaCard-module__card',
+    quotaHead: 'QuotaCard-module__head',
+    quotaIconWrap: 'QuotaCard-module__iconWrap',
+    quotaIconFallback: 'QuotaCard-module__iconFallback',
+    quotaFileName: 'QuotaCard-module__fileName',
+    quotaBody: 'QuotaCard-module__body',
+    quotaIdleBody: 'QuotaCard-module__idleBody',
+    quotaIdleGlyph: 'QuotaCard-module__idleGlyph',
+    quotaIdleHint: 'QuotaCard-module__idleHint',
+    quotaActionRow: 'QuotaCard-module__actionRow',
+    quotaActionPill: 'QuotaCard-module__actionPill',
+    quotaSpinning: 'QuotaCard-module__spinning',
+    quotaErrorStrip: 'QuotaCard-module__errorStrip',
+    // Two earlier attempts to locate an auth-file card both failed against the
+    // real panel, so the constraints are recorded here:
+    //
+    //   1. There is no `AuthFileCard-module__card` class at all.
+    //   2. `AuthFileCard-module__fileName` is NOT universal — measured on the
+    //      live panel it exists on 3 of 6 cards (the Antigravity ones only).
+    //      WorkBuddy ('codebuddy') cards render `...__account` instead, so
+    //      anchoring on `fileName` skipped exactly the cards we care about.
+    //
+    // What IS universal: every card is an <article> that contains a
+    // `...__actions` footer. So find the footers, then walk up to their
+    // <article>. The name comes from whichever label the card happens to use.
+    authFileName: 'AuthFileCard-module__fileName',
+    authAccount: 'AuthFileCard-module__account',
+    authActions: 'AuthFileCard-module__actions',
+    authActionsMain: 'AuthFileCard-module__actionsMain',
+    authUtility: 'AuthFileCard-module__utilityActions',
+    authIconButton: 'AuthFileCard-module__iconButton'
+  };
+
+  // ------------------------------------------------------------- utilities
+
+  var log = function () {
+    try { console.debug.apply(console, ['[wb-patch]'].concat([].slice.call(arguments))); } catch (e) {}
+  };
+
+  /** Resolve a hashed class name: prefer one that exists in the DOM now. */
+  function cls(base) {
+    try {
+      var hit = document.querySelector('[class*="' + base + '__"]');
+      if (hit) {
+        var m = String(hit.className).match(new RegExp(base + '__[\\w-]+'));
+        if (m) return m[0];
+      }
+    } catch (e) {}
+    return base; // fall back to the bare module name; the browser will not
+                 // match it, but the element still renders (unstyled, visible)
+  }
+
+  function el(tag, className, text) {
+    var n = document.createElement(tag);
+    if (className) n.className = className;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
+
+  // ----------------------------------------------------- management key
+
+  var mgmtKey = '';
+
+  function rememberKey(value) {
+    if (typeof value !== 'string') return;
+    var m = /^Bearer\s+(.+)$/i.exec(value.trim());
+    var key = (m ? m[1] : value).trim();
+    if (key && key !== mgmtKey) {
+      mgmtKey = key;
+      log('management key captured');
+    }
+  }
+
+  // The panel sends its key on every management call, so watching outbound
+  // requests is enough — no need to read storage or prompt the user.
+  (function hookFetch() {
+    if (!window.fetch || window.fetch.__wbHooked) return;
+    var orig = window.fetch;
+    var wrapped = function (input, init) {
+      try {
+        var h = (init && init.headers) || (input && input.headers);
+        if (h) {
+          if (typeof h.get === 'function') rememberKey(h.get('Authorization') || h.get('X-Management-Key'));
+          else if (Array.isArray(h)) h.forEach(function (p) { if (/^(authorization|x-management-key)$/i.test(p[0])) rememberKey(p[1]); });
+          else Object.keys(h).forEach(function (k) { if (/^(authorization|x-management-key)$/i.test(k)) rememberKey(h[k]); });
+        }
+      } catch (e) {}
+      return orig.apply(this, arguments);
+    };
+    wrapped.__wbHooked = true;
+    window.fetch = wrapped;
+  })();
+
+  (function hookXHR() {
+    if (!window.XMLHttpRequest || window.XMLHttpRequest.__wbHooked) return;
+    var orig = window.XMLHttpRequest;
+    var origOpen = orig.prototype.open;
+    var origSend = orig.prototype.send;
+    var origSetHeader = orig.prototype.setRequestHeader;
+    orig.prototype.setRequestHeader = function (name, value) {
+      try { if (/^(authorization|x-management-key)$/i.test(name)) rememberKey(value); } catch (e) {}
+      return origSetHeader.apply(this, arguments);
+    };
+    orig.prototype.open = function () { this.__wbUrl = arguments[1]; return origOpen.apply(this, arguments); };
+    orig.prototype.send = function () {
+      var self = this;
+      try {
+        this.addEventListener('load', function () {
+          try {
+            // The gate and the card list both come from these responses, so a
+            // panel-triggered refresh is a good moment to re-render.
+            if (/\/plugins$/.test(String(self.__wbUrl))) invalidateGate();
+          } catch (e) {}
+        });
+      } catch (e) {}
+      return origSend.apply(this, arguments);
+    };
+    window.XMLHttpRequest.__wbHooked = true;
+  })();
+
+  /** Also accept a key the panel put in localStorage, if it did. */
+  try {
+    var stored = window.localStorage && window.localStorage.getItem('managementKey');
+    if (stored) rememberKey(stored);
+  } catch (e) {}
+
+  function api(path, options) {
+    var opt = options || {};
+    var headers = { 'Content-Type': 'application/json' };
+    if (mgmtKey) { headers['Authorization'] = 'Bearer ' + mgmtKey; headers['X-Management-Key'] = mgmtKey; }
+    return fetch(API + path, {
+      method: opt.method || 'GET',
+      headers: headers,
+      body: opt.body ? JSON.stringify(opt.body) : undefined,
+      credentials: 'same-origin'
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  // ------------------------------------------------------------- the gate
+
+  var gate = { at: 0, ok: false };
+  function invalidateGate() { gate.at = 0; }
+
+  function pluginEnabled() {
+    var now = Date.now();
+    if (gate.at && now - gate.at < GATE_TTL_MS) return Promise.resolve(gate.ok);
+    return api('/plugins').then(function (j) {
+      var list = (j && j.plugins) || [];
+      var hit = null;
+      for (var i = 0; i < list.length; i++) if (list[i].id === PLUGIN_ID) hit = list[i];
+      gate.ok = !!(hit && hit.registered && hit.effective_enabled);
+      gate.at = Date.now();
+      return gate.ok;
+    }).catch(function () {
+      // A failed gate read must not hide the cards: the panel may simply be
+      // mid-login. Keep the last answer.
+      gate.at = Date.now();
+      return gate.ok;
+    });
+  }
+
+  // -------------------------------------------------------- account list
+
+  function accounts() {
+    return api('/auth-files').then(function (j) {
+      var files = (j && j.files) || [];
+      var byName = {};
+      files.forEach(function (f) {
+        var type = String(f.type || f.provider || '').toLowerCase();
+        if (type !== PROVIDER) return;
+        if (f.runtime_only) return;
+        // The host lists two entries per physical file (one keyed by filename,
+        // one by UUID). Keep the one whose label carries more information.
+        var prev = byName[f.name];
+        if (!prev) { byName[f.name] = f; return; }
+        var better = String(f.label || '').length > String(prev.label || '').length;
+        if (better) byName[f.name] = f;
+      });
+      return Object.keys(byName).map(function (k) { return byName[k]; });
+    });
+  }
+
+  function quotaFor(authIndex) {
+    return api('/quota/fetch', { method: 'POST', body: { auth_index: authIndex } });
+  }
+
+  /** Render the fetched quota into the shared quota-strip markup. */
+  function quotaLines(q) {
+    var out = { text: '', percent: null };
+    if (!q) return out;
+    var summary = (q.summary || [])[0];
+    var bucket = ((q.groups || [])[0] || {}).buckets ? q.groups[0].buckets[0] : null;
+    var parts = [];
+    if (summary) parts.push((summary.label || 'quota') + ' ' + summary.value + (summary.unit ? ' ' + summary.unit : ''));
+    if (bucket && typeof bucket.remainingFraction === 'number') {
+      // The upstream reports 1 for "available"; there is no total, so a true
+      // percentage cannot be shown. Say what the number means instead.
+      parts.push(bucket.remainingFraction >= 1 ? '额度可用' : Math.round(bucket.remainingFraction * 100) + '%');
+      out.percent = bucket.remainingFraction;
+    }
+    out.text = parts.join(' · ') || '已获取额度';
+    return out;
+  }
+
+  // ------------------------------------------------------ #/quota cards
+
+  function quotaGrid() {
+    var g = document.querySelector('.' + cls(CLS.quotaGrid));
+    if (g) return g;
+    var any = document.querySelector('[class*="' + CLS.quotaGrid + '__"]');
+    return any;
+  }
+
+  /** Do not render on the login page: its hash can also be #/quota. */
+  function onLoginPage() {
+    return !!document.querySelector('[class*="LoginPage-module__"]');
+  }
+
+  function buildQuotaCard(account) {
+    var card = el('article', cls(CLS.quotaCard));
+    card.setAttribute('data-wb-card', account.name);
+
+    var head = el('div', cls(CLS.quotaHead));
+    var iconWrap = el('div', cls(CLS.quotaIconWrap));
+    iconWrap.appendChild(el('span', cls(CLS.quotaIconFallback), 'W'));
+    head.appendChild(iconWrap);
+    head.appendChild(el('div', cls(CLS.quotaFileName), String(account.name).replace(/\.json$/, '')));
+    card.appendChild(head);
+
+    var body = el('div', cls(CLS.quotaBody));
+    var idle = el('button', cls(CLS.quotaIdleBody));
+    idle.type = 'button';
+    idle.appendChild(el('span', cls(CLS.quotaIdleGlyph), '↻'));
+    idle.appendChild(el('span', cls(CLS.quotaIdleHint), '点击此处刷新额度'));
+    body.appendChild(idle);
+    card.appendChild(body);
+
+    idle.addEventListener('click', function () {
+      if (idle.disabled) return;
+      idle.disabled = true;
+      idle.classList.add(cls(CLS.quotaSpinning));
+      clear(body);
+      body.appendChild(el('div', cls(CLS.quotaIdleHint), '读取中…'));
+      quotaFor(account.auth_index).then(function (q) {
+        var lines = quotaLines(q);
+        clear(body);
+        var strip = el('div', 'wb-quota-strip');
+        strip.appendChild(el('div', 'wb-quota-line', lines.text));
+        body.appendChild(strip);
+
+        var row = el('div', cls(CLS.quotaActionRow));
+        var pill = el('button', cls(CLS.quotaActionPill), '刷新额度');
+        pill.type = 'button';
+        pill.addEventListener('click', function () { idle.disabled = false; idle.click(); });
+        row.appendChild(pill);
+        body.appendChild(row);
+      }).catch(function (e) {
+        clear(body);
+        body.appendChild(el('div', cls(CLS.quotaErrorStrip) , '额度读取失败：' + e.message));
+        idle.disabled = false;
+        idle.classList.remove(cls(CLS.quotaSpinning));
+        body.appendChild(idle);
+      });
+    });
+
+    return card;
+  }
+
+  function paintQuotaCards(list) {
+    var grid = quotaGrid();
+    if (!grid || onLoginPage()) return;
+    // Rebuild only when the account set changed, so a re-render cannot fight
+    // the MutationObserver that triggered it.
+    var want = list.map(function (a) { return a.name; }).join('\u0000');
+    if (grid.getAttribute('data-wb-painted') === want) return;
+    Array.prototype.forEach.call(grid.querySelectorAll('[data-wb-card]'), function (n) { n.remove(); });
+    list.forEach(function (a) { grid.appendChild(buildQuotaCard(a)); });
+    grid.setAttribute('data-wb-painted', want);
+  }
+
+  // ------------------------------------------------- #/auth-files strip
+
+  /**
+   * Extract an auth-file name from a card label such as
+   * "Codebuddy\ncodebuddy-27442c7b-4b55-4dda-81a3-c986f767fac6".
+   *
+   * The label may or may not carry a provider badge, and the badge text is not
+   * fixed ("Codebuddy" today). Rather than hard-coding either, take the last
+   * whitespace-separated token that looks like a file name: it must contain a
+   * dash and no spaces. Everything before it is treated as the badge.
+   */
+  function accountNameFromLabel(raw) {
+    var parts = String(raw || '').split(/[\s\u00a0]+/).filter(Boolean);
+    for (var i = parts.length - 1; i >= 0; i--) {
+      var p = parts[i];
+      if (p.indexOf('.json') >= 0) return p;
+      // A workbuddy/codebuddy auth file name looks like "<provider>-<uuid>".
+      if (p.indexOf('-') > 0 && /^[A-Za-z0-9._-]+$/.test(p)) return p;
+    }
+    return '';
+  }
+
+  /**
+   * Locate the official auth-file cards and read each one's identity.
+   *
+   * Anchored on the actions footer rather than on a label: measured against the
+   * live panel, `__fileName` is rendered only on Antigravity cards while
+   * WorkBuddy cards use `__account` — anchoring on either one alone misses
+   * cards. Every card, however, has an `__actions` footer inside its
+   * <article>, so that is the reliable starting point.
+   *
+   * Returns { node, label } where label is the card's own identity text; the
+   * caller decides whether it looks like the account it wants.
+   */
+  function authCards() {
+    var out = [];
+    var seen = [];
+    var footers = document.querySelectorAll('[class*="' + CLS.authActions + '__"]');
+    Array.prototype.forEach.call(footers, function (footer) {
+      // Walk up to the card root.
+      var node = footer;
+      for (var i = 0; i < 6 && node; i++) {
+        node = node.parentElement;
+        if (node && node.tagName === 'ARTICLE') break;
+      }
+      if (!node || node.tagName !== 'ARTICLE') return;
+      if (seen.indexOf(node) >= 0) return;
+      seen.push(node);
+
+      // Identity: whichever label this card build uses.
+      //
+      //   `fileName` holds "name.json" verbatim.
+      //   `account` is NOT a bare name — measured on the live panel its
+      //   textContent is "Codebuddy\ncodebuddy-27442c7b-…", i.e. the provider
+      //   badge and the name in one node. Taking it verbatim produced
+      //   "Codebuddy codebuddy-…json", which never matches the API's file
+      //   names. So pull the name out by pattern instead of trusting the node.
+      var label = '';
+      var fn = node.querySelector('[class*="' + CLS.authFileName + '__"]');
+      var acct = node.querySelector('[class*="' + CLS.authAccount + '__"]');
+      if (fn && fn.textContent.trim()) {
+        label = fn.textContent.trim();
+      } else if (acct && acct.textContent.trim()) {
+        label = accountNameFromLabel(acct.textContent);
+      }
+      if (!label) return;
+      if (label.indexOf('.json') < 0) label += '.json';
+      out.push({ node: node, name: label, footer: footer });
+    });
+    return out;
+  }
+
+  function buildStrip(account) {
+    var strip = el('div', 'wb-quota-strip');
+    strip.setAttribute('data-wb-strip', '1');
+    var btn = el('button', 'wb-quota-line', '点击此处刷新额度');
+    btn.type = 'button';
+    btn.style.cssText = 'cursor:pointer;background:0 0;border:0;padding:0;text-align:left;font:inherit;color:inherit';
+    btn.addEventListener('click', function () {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = '读取中…';
+      quotaFor(account.auth_index).then(function (q) {
+        btn.textContent = quotaLines(q).text;
+        btn.classList.remove('wb-quota-err');
+      }).catch(function (e) {
+        btn.textContent = '额度读取失败：' + e.message;
+        btn.classList.add('wb-quota-err');
+        btn.disabled = false;
+      });
+    });
+    strip.appendChild(btn);
+    return strip;
+  }
+
+  /** The official panel only renders this button for its hard-coded set. */
+  /**
+   * Build the "refresh OAuth credential" button the official whitelist omits.
+   *
+   * The icon is cloned from a real official button when one is present: the
+   * panel renders this control for its hard-coded providers, so on a page with
+   * e.g. an Antigravity card there is an exact SVG to copy. That keeps the
+   * glyph identical to the official one instead of approximating it with a
+   * text character (measured: the text "↻" has visibly different stroke weight
+   * from the official SVG even though the computed box was identical).
+   * Falls back to the text glyph only when no official button exists to clone.
+   */
+  function officialRefreshIcon() {
+    var buttons = document.querySelectorAll('[class*="' + CLS.authIconButton + '__"]');
+    for (var i = 0; i < buttons.length; i++) {
+      var svg = buttons[i].querySelector('svg');
+      if (svg) return svg.cloneNode(true);
+    }
+    return null;
+  }
+
+  function buildRefreshButton(account) {
+    var btn = el('button', cls(CLS.authIconButton), null);
+    btn.type = 'button';
+    btn.className = (btn.className + ' btn btn-secondary btn-sm').trim();
+    btn.title = '刷新 OAuth 凭证';
+    btn.setAttribute('data-wb-refresh', '1');
+
+    var icon = officialRefreshIcon();
+    if (icon) {
+      var wrap = el('span', null, null);
+      wrap.appendChild(icon);
+      btn.appendChild(wrap);
+    } else {
+      btn.textContent = '↻';
+    }
+
+    btn.addEventListener('click', function () {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      var old = btn.innerHTML;
+      btn.textContent = '…';
+      api('/auth-files/refresh', { method: 'POST', body: { name: account.name, auth_index: account.auth_index || '' } })
+        .then(function () { btn.title = '已提交刷新请求'; })
+        .catch(function (e) { btn.title = '刷新失败：' + e.message; })
+        .then(function () { btn.innerHTML = old; btn.disabled = false; });
+    });
+    return btn;
+  }
+
+  function paintAuthStrips(list) {
+    var byName = {};
+    list.forEach(function (a) { byName[a.name] = a; });
+    authCards().forEach(function (c) {
+      var account = byName[c.name];
+      // Only our own accounts: other providers' cards share this markup and
+      // must be left untouched.
+      if (!account) return;
+      var footer = c.footer;
+      // `footer` is the element we anchored on, but the official markup puts
+      // it *inside* the card, so it must still be a descendant of c.node.
+      if (!footer || !c.node.contains(footer)) {
+        footer = c.node.querySelector('[class*="' + CLS.authActions + '__"]');
+      }
+      var main = footer && footer.querySelector('[class*="' + CLS.authActionsMain + '__"]');
+      var util = main && main.querySelector('[class*="' + CLS.authUtility + '__"]');
+      if (util && !util.querySelector('[data-wb-refresh]')) {
+        util.insertBefore(buildRefreshButton(account), util.firstChild);
+      }
+      if (footer && !c.node.querySelector('[data-wb-strip]')) {
+        c.node.insertBefore(buildStrip(account), footer);
+      }
+    });
+  }
+
+  // ----------------------------------------------------------- the loop
+
+  var busy = false;
+
+  function tick() {
+    if (busy) return;
+    busy = true;
+    pluginEnabled().then(function (on) {
+      if (!on) {
+        document.querySelectorAll('[data-wb-card],[data-wb-strip],[data-wb-refresh]').forEach(function (n) {
+          n.setAttribute('data-wb-hidden', '1');
+        });
+        return null;
+      }
+      return accounts().then(function (list) {
+        list.forEach(function (a) {});
+        document.querySelectorAll('[data-wb-hidden]').forEach(function (n) { n.removeAttribute('data-wb-hidden'); });
+        paintQuotaCards(list);
+        paintAuthStrips(list);
+        return null;
+      });
+    }).catch(function (e) {
+      log('tick failed: ' + (e && e.message));
+    }).then(function () { busy = false; });
+  }
+
+  setTimeout(tick, 300);
+  setInterval(tick, TICK_MS);
+
+  // A DOM observer keeps the cards alive when React re-renders the page.
+  // It watches only the two containers we touch and calls a function that is
+  // itself idempotent, so it cannot loop.
+  try {
+    var obs = new MutationObserver(function () { tick(); });
+    obs.observe(document.body, { childList: true, subtree: true });
+  } catch (e) {}
+
+  // ------------------------------------------------------------ self-check
+
+  window.__wbQuotaState = function () {
+    return {
+      ver: window.__wbQuotaPatch,
+      keyCaptured: !!mgmtKey,
+      gate: gate.ok,
+      cards: document.querySelectorAll('[data-wb-card]').length,
+      strips: document.querySelectorAll('[data-wb-strip]').length,
+      hidden: document.querySelectorAll('[data-wb-hidden]').length
+    };
+  };
+})();
+</script>

@@ -1,0 +1,496 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+// This file implements CPA's ModelProvider capability for WorkBuddy, which is
+// what makes the models show up in /v1/models and in the management panel.
+//
+// Two entry points:
+//
+//	model.static   -> StaticModels   : models available without any credential
+//	model.for_auth -> ModelsForAuth  : models for one concrete credential
+//
+// WorkBuddy's catalogue is always credential-scoped (a2/b.java w() needs a
+// bearer token), so StaticModels returns the cached snapshot when available and
+// nothing otherwise, while ModelsForAuth performs the real upstream call.
+
+// modelCache memoises the per-credential catalogue so repeated /v1/models calls
+// do not hammer the upstream. WorkBuddy's list is small and changes rarely.
+type modelCacheEntry struct {
+	models    []workBuddyModel
+	fetchedAt time.Time
+	err       error
+}
+
+var workBuddyModelCache = newModelCache()
+
+type modelCache struct {
+	mu  sync.Mutex
+	ttl time.Duration
+	// keyed by authID
+	entries map[string]modelCacheEntry
+}
+
+func newModelCache() *modelCache {
+	return &modelCache{ttl: 10 * time.Minute, entries: make(map[string]modelCacheEntry)}
+}
+
+func (c *modelCache) get(key string) ([]workBuddyModel, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Since(entry.fetchedAt) > c.ttl {
+		delete(c.entries, key)
+		return nil, false
+	}
+	return entry.models, true
+}
+
+func (c *modelCache) put(key string, models []workBuddyModel) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[key] = modelCacheEntry{models: models, fetchedAt: time.Now()}
+}
+
+// clear drops every cached catalogue.
+//
+// Needed because the cache outlives a plugin upgrade: the .so is replaced in
+// place and the process keeps the old entries for up to ten minutes, so a fixed
+// model list can still render short right after updating. An operator can force
+// a refetch with /workbuddy/models?refresh=1.
+func (c *modelCache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]modelCacheEntry)
+}
+
+func (c *modelCache) snapshot() []workBuddyModel {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seen := make(map[string]struct{})
+	var out []workBuddyModel
+	for _, entry := range c.entries {
+		for _, m := range entry.models {
+			if _, dup := seen[m.ID]; dup {
+				continue
+			}
+			seen[m.ID] = struct{}{}
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// modelStatic answers model.static.
+//
+// WorkBuddy cannot enumerate models unauthenticated, so the catalogue is built
+// from the first usable credential. Reading only the cache would leave the list
+// empty until something else triggered a fetch, which is why this falls back to
+// a live query.
+func modelStatic(request []byte) ([]byte, error) {
+	var req pluginapi.StaticModelRequest
+	if len(request) > 0 {
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
+	_ = req
+
+	models := workBuddyModelCache.snapshot()
+	if len(models) == 0 {
+		models = fetchCatalogueFromAnyCredential()
+	}
+
+	return okEnvelope(pluginapi.ModelResponse{
+		Provider: workBuddyProviderKey,
+		Models:   modelsToInfo(models),
+	})
+}
+
+// fetchCatalogueFromAnyCredential queries the model catalogue using the first
+// WorkBuddy credential it can find, and caches the result.
+//
+// It returns nil when there is no credential or the upstream call fails; the
+// caller then reports an empty list rather than an error, so the host keeps
+// serving other providers.
+func fetchCatalogueFromAnyCredential() []workBuddyModel {
+	for _, account := range listWorkBuddyAccounts() {
+		if account.Disabled || account.Expired {
+			continue
+		}
+		creds := account.credentials
+		if creds == nil || creds.AccessToken == "" {
+			continue
+		}
+		models, errList := workBuddyUpstream.listModels(context.Background(), creds)
+		if errList != nil || len(models) == 0 {
+			continue
+		}
+		workBuddyModelCache.put(creds.AuthKey(), models)
+		return models
+	}
+	return nil
+}
+
+// modelForAuth answers model.for_auth: fetch the catalogue for one credential.
+func modelForAuth(request []byte) ([]byte, error) {
+	var req pluginapi.AuthModelRequest
+	if len(request) > 0 {
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
+
+	// Only handle our own provider; anything else is not ours to answer.
+	if req.AuthProvider != "" && !isWorkBuddyProvider(req.AuthProvider) {
+		return okEnvelope(pluginapi.ModelResponse{})
+	}
+
+	creds, errParse := parseWorkBuddyCredentials(req.StorageJSON)
+	if errParse != nil {
+		// The credential body could not be parsed (e.g. the host passed only
+		// metadata). Report the built-in list rather than an empty response:
+		// CPA shows "该凭证暂无可用模型" for an empty list, which hides a
+		// credential that may well work.
+		return okEnvelope(pluginapi.ModelResponse{
+			Provider: workBuddyProviderKey,
+			Models:   modelsToInfo(fallbackModelsCopy()),
+		})
+	}
+
+	cacheKey := creds.AuthKey()
+	if cached, ok := workBuddyModelCache.get(cacheKey); ok {
+		return okEnvelope(pluginapi.ModelResponse{
+			Provider: workBuddyProviderKey,
+			Models:   modelsToInfo(cached),
+		})
+	}
+
+	models, errList := workBuddyUpstream.listModels(context.Background(), creds)
+	if errList != nil {
+		// A failed live query must not make the credential look empty.
+		models = fallbackModelsCopy()
+	}
+	models, usedFallback := modelsOrFallback(models)
+	if !usedFallback {
+		workBuddyModelCache.put(cacheKey, models)
+	}
+
+	return okEnvelope(pluginapi.ModelResponse{
+		Provider: workBuddyProviderKey,
+		Models:   modelsToInfo(models),
+	})
+}
+
+// modelsToInfo converts the provider catalogue into CPA's ModelInfo shape.
+func modelsToInfo(models []workBuddyModel) []pluginapi.ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	// The ID is prefixed with the provider key. Without it a bare
+	// "deepseek-v4-flash" collides with the same model served by another plugin
+	// (trae advertises "DeepSeek-V4-Flash"), and the merged list gives the
+	// client no way to say which upstream it means. The prefix is also what
+	// model.route already expects: splitProviderPrefix() accepts
+	// "codebuddy/<model>", so the advertised and accepted names now agree.
+	//
+	// Casing is preserved: the upstream distinguishes models by exact spelling,
+	// and the catalogue is the authority on it.
+	out := make([]pluginapi.ModelInfo, 0, len(models))
+	for _, m := range models {
+		native := strings.TrimSpace(m.ID)
+		if native == "" {
+			continue
+		}
+		qualified := qualifyModelID(native)
+		info := pluginapi.ModelInfo{
+			// ID is what clients send in "model".
+			ID:   qualified,
+			Name: qualified,
+			// Version carries the bare upstream name: it must not be sent with
+			// the prefix, and it is useful in diagnostics.
+			Version:     native,
+			Object:      "model",
+			OwnedBy:     workBuddyProviderKey,
+			Type:        "chat",
+			DisplayName: firstNonEmpty(m.DisplayName, native),
+			Description: "WorkBuddy 上游模型（原生名 " + native + "）",
+		}
+		if limit := m.contextWindow(); limit > 0 {
+			info.InputTokenLimit = limit
+			info.ContextLength = limit
+		}
+		if m.MaxOutputTokens > 0 {
+			info.OutputTokenLimit = m.MaxOutputTokens
+			info.MaxCompletionTokens = m.MaxOutputTokens
+		}
+		info.SupportedInputModalities = inputModalitiesFor(m)
+		info.SupportedOutputModalities = []string{"text"}
+		info.SupportedGenerationMethods = []string{"chat.completions"}
+		info.Thinking = thinkingSupportFor(m)
+		out = append(out, info)
+	}
+	return out
+}
+
+// inputModalitiesFor declares the input modalities a model accepts.
+//
+// Both catalogue flags must agree: several entries pair supportsImages=true with
+// disabledMultimodal=true, and advertising those as vision-capable would promise
+// what the upstream rejects. Text is always claimed — CPA reads an empty list as
+// "nothing allowed", which is never the intent.
+func inputModalitiesFor(m workBuddyModel) []string {
+	if m.acceptsImages() {
+		return []string{"text", "image"}
+	}
+	return []string{"text"}
+}
+
+// thinkingSupportFor declares a model's reasoning levels; nil means it does not
+// think, which stops CPA offering a control the upstream would reject.
+//
+// Levels come from the catalogue in order of specificity: supportedEfforts (the
+// model's own enumeration), a pinned effort, defaultEffort, then the
+// upstream-wide vocabulary. That last fallback matters: most entries enumerate
+// nothing yet are reasoning models reached through the same reasoning_effort
+// field, so reporting "no thinking" would hide the capability this change
+// exists to expose. ZeroAllowed mirrors canDisableThinking, defaulting to
+// "not onlyReasoning".
+func thinkingSupportFor(m workBuddyModel) *pluginapi.ThinkingSupport {
+	if !m.SupportsReasoning && !m.OnlyReasoning && m.Reasoning == nil {
+		return nil
+	}
+	zeroAllowed := !m.OnlyReasoning
+	if m.Reasoning != nil && m.Reasoning.CanDisableThinking != nil {
+		zeroAllowed = *m.Reasoning.CanDisableThinking
+	}
+	return &pluginapi.ThinkingSupport{
+		Levels:      reasoningLevelsFor(m.Reasoning),
+		ZeroAllowed: zeroAllowed,
+	}
+}
+
+// reasoningLevelsFor keeps the catalogue's spelling and order, because the
+// upstream is case-sensitive; values are deduplicated only.
+func reasoningLevelsFor(r *workBuddyReasoning) []string {
+	if r == nil {
+		return allReasoningLevels()
+	}
+	seen := make(map[string]struct{}, len(r.SupportedEfforts))
+	out := make([]string, 0, len(r.SupportedEfforts))
+	for _, level := range r.SupportedEfforts {
+		if level = strings.TrimSpace(level); level == "" {
+			continue
+		}
+		if _, dup := seen[level]; dup {
+			continue
+		}
+		seen[level] = struct{}{}
+		out = append(out, level)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	for _, candidate := range []*string{r.Effort, r.DefaultEffort} {
+		if candidate != nil && strings.TrimSpace(*candidate) != "" {
+			return []string{strings.TrimSpace(*candidate)}
+		}
+	}
+	return allReasoningLevels()
+}
+
+func allReasoningLevels() []string {
+	return []string{"minimal", "low", "medium", "high", "xhigh", "max"}
+}
+
+// qualifyModelID prepends the provider key unless the name already carries it,
+// so an ID never gains the prefix twice, or unless the operator asked for bare
+// names through model_prefix.
+// qualifyModelID returns the model name as the plugin publishes it.
+//
+// The name is the bare upstream id: "deepseek-v4-pro", not
+// "codebuddy/deepseek-v4-pro". CPA would derive a "<pluginID>/<model>" spelling
+// for the registry it builds itself, but callers read the names the plugin
+// advertises here, and an unprefixed name is what the upstream accepts, so
+// there is nothing to add and nothing to strip on the way back out.
+func qualifyModelID(native string) string {
+	native = strings.TrimSpace(native)
+	// Tolerate a prefixed input so an older config or cached entry cannot
+	// publish "codebuddy/codebuddy/<model>".
+	if strings.HasPrefix(strings.ToLower(native), workBuddyProviderKey+"/") {
+		return native[len(workBuddyProviderKey)+1:]
+	}
+	return native
+}
+
+// nativeModelID strips a recognised provider prefix, yielding the name the
+// upstream expects. Unprefixed names pass through unchanged.
+func nativeModelID(model string) string {
+	model = strings.TrimSpace(model)
+	if provider, rest, ok := splitProviderPrefix(model); ok && isWorkBuddyProvider(provider) {
+		return rest
+	}
+	return model
+}
+
+// isWorkBuddyProvider reports whether a provider/type field names this plugin.
+//
+// The comparison is case-insensitive on purpose. CPA takes the value returned by
+// auth.identifier, lower-cases it (pluginhost/auth_provider.go normalizes both
+// the value it passes to auth.parse and the one it writes into the auth file),
+// and can therefore record "workbuddy" where this plugin was created under
+// "codebuddy". A case-sensitive switch silently stopped recognising the plugin's
+// own accounts once the label became "WorkBuddy".
+func isWorkBuddyProvider(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case workBuddyProviderKey, workBuddyDisplayNameLower:
+		return true
+	}
+	return false
+}
+
+// workBuddyDisplayNameLower is the persisted form of the display name: CPA
+// lower-cases whatever auth.identifier returned before storing it. It coincides
+// with pluginName, which is why the routing key must not be returned from
+// auth.identifier.
+const workBuddyDisplayNameLower = "workbuddy"
+
+// handleModelsRequest answers GET /workbuddy/models.
+//
+// It reports the catalogue the plugin would return for each account, so the
+// operator can verify what the upstream actually serves without digging through
+// CPA's auth-file page (which only shows one account at a time and depends on
+// the host's plugin model registration).
+//
+// ?refresh=1 bypasses the 10-minute catalogue cache, which matters after an
+// upgrade: a stale entry would otherwise keep showing the previous, shorter
+// list for up to ten minutes.
+func handleModelsRequest(req pluginapi.ManagementRequest) (managementResponse, bool) {
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	if method != http.MethodGet && method != http.MethodPost {
+		return managementResponse{StatusCode: http.StatusMethodNotAllowed}, true
+	}
+
+	if strings.TrimSpace(req.Query.Get("refresh")) != "" {
+		workBuddyModelCache.clear()
+	}
+
+	// Every realm has a model catalogue, so this must not use the check-in list, which
+	// holds domestic accounts only and left international accounts out of the report.
+	accounts, errCollect := collectAllAccounts()
+	if errCollect != nil {
+		return managementResponse{
+			StatusCode: http.StatusOK,
+			Headers:    jsonResponseHeaders(),
+			Body:       mustJSON(map[string]any{"ok": false, "error": errCollect.Error()}),
+		}, true
+	}
+
+	type accountModels struct {
+		UID        string   `json:"uid"`
+		Label      string   `json:"label"`
+		Variant    string   `json:"variant"`
+		Source     string   `json:"source"`
+		Count      int      `json:"count"`
+		Models     []string `json:"models"`
+		Error      string   `json:"error,omitempty"`
+		FromCache  bool     `json:"from_cache"`
+		APIBase    string   `json:"api_base"`
+		ModelsPath string   `json:"models_path"`
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	out := make([]accountModels, 0, len(accounts))
+	for _, account := range accounts {
+		creds := account.Creds
+		variant := variantForCredentials(creds)
+		entry := accountModels{
+			UID:        creds.UID,
+			Label:      firstNonEmpty(account.Label, creds.label()),
+			Variant:    string(variant),
+			APIBase:    workBuddyBaseURL(creds.Domain),
+			ModelsPath: workBuddyModelsPath,
+		}
+
+		// Report whether the answer came from cache, so a stale list is obvious.
+		if _, okCache := workBuddyModelCache.get(creds.AuthKey()); okCache {
+			entry.FromCache = true
+		}
+
+		models, errList := workBuddyUpstream.listModels(ctx, creds)
+		if errList != nil {
+			entry.Error = errList.Error()
+			models = fallbackModelsCopy()
+			entry.Source = "builtin-fallback"
+		} else {
+			entry.Source = "upstream"
+		}
+		entry.Count = len(models)
+		entry.Models = make([]string, 0, len(models))
+		for _, m := range models {
+			entry.Models = append(entry.Models, qualifyModelID(m.ID))
+		}
+		out = append(out, entry)
+	}
+
+	return managementResponse{
+		StatusCode: http.StatusOK,
+		Headers:    jsonResponseHeaders(),
+		Body: mustJSON(map[string]any{
+			"ok":       true,
+			"accounts": out,
+			"hint": "source=upstream 表示来自上游实时查询；builtin-fallback 表示上游查询失败，" +
+				"returned the five built-in models. Add ?refresh=1 to bypass the 10-minute cache.",
+		}),
+	}, true
+}
+
+// ownsModel reports whether a model id belongs to this plugin.
+//
+// The catalogue is the list this plugin fetched from its own upstream and registered
+// with the host; anything outside it is another provider's model that merely happens to
+// pass through the same CPA process.
+//
+// This is the check that keeps other providers' traffic out of the call list. Routing
+// alone cannot do it: a request whose model carries no "provider/" prefix falls back to
+// the default provider, so a grok or gpt-oss call would be routed — and stamped — as if
+// it were this plugin's.
+func ownsModel(model string) bool {
+	id := strings.ToLower(strings.TrimSpace(model))
+	if id == "" {
+		return false
+	}
+	models := workBuddyModelCache.snapshot()
+	if len(models) == 0 {
+		// The catalogue has not been fetched yet. Refusing every request until it has
+		// would take the plugin offline at startup, so the answer is "unknown" and the
+		// caller decides — the request path treats it as owned, the recording path
+		// treats it as not.
+		return false
+	}
+	for _, m := range models {
+		if strings.EqualFold(strings.TrimSpace(m.ID), id) {
+			return true
+		}
+	}
+	return false
+}
+
+// catalogueLoaded reports whether the model catalogue has been fetched.
+func catalogueLoaded() bool {
+	return len(workBuddyModelCache.snapshot()) > 0
+}

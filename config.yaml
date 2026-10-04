@@ -1,0 +1,96 @@
+# wb2api 配置
+#
+# 改动后需要重启服务（菜单 3 重启 / npm run stop && npm start）。
+# 环境变量可覆盖同名项：WB2API_PORT / WB2API_HOST / WB2API_ENDPOINT / WB2API_WORKBUDDY_EXE
+
+server:
+  host: 127.0.0.1
+  # 18787 被 xm2api 占了，这里用 18788，互不打架
+  port: 18788
+  # 客户端 api_key 会被忽略（保留字段只为兼容 SDK 形状）
+  apiKey: wb2api
+  # 单次请求体上限（字节）
+  maxBodyBytes: 33554432
+
+upstream:
+  # WorkBuddy 一方网关
+  endpoint: https://copilot.tencent.com
+  chatPath: /v2/chat/completions
+  configPath: /v3/config
+  # 桌面端（plugin 平台）的续期路径；注意 /v2/auth/token/refresh 是 404
+  refreshPath: /v2/plugin/auth/token/refresh
+  # 与 WorkBuddy 客户端版本对齐，上游会校验 UA / X-IDE-Version
+  appVersion: "5.6.2"
+  productTag: SaaS
+  ideName: WorkBuddy
+  # 上游只支持流式；对要求 stream:false 的客户端由本服务聚合
+  timeoutMs: 300000
+  # 思考等级。上游只认**顶层蛇形** `reasoning_effort`：
+  #   reasoning_effort: "max"        → 出 reasoning_content + reasoning_tokens（实测 58）
+  #   reasoning: {effort: "max"}     → 被静默忽略（0 字符 / 0 tokens）
+  # 取值 minimal|low|medium|high|xhigh|max。留空 = 不注入，上游完全不思考。
+  # 客户端若自己传了 reasoning_effort / reasoning.effort，以客户端为准（不会被覆盖）。
+  # 环境变量：WB2API_REASONING_EFFORT（off/none 或空 = 关）
+  reasoningEffort: max
+  # 思考摘要（上游支持 "auto"）；留空则不注入
+  reasoningSummary: auto
+
+credentials:
+  # WorkBuddy 主程序：只用来跑 ELECTRON_RUN_AS_NODE 取静态密钥，不会真的启动界面
+  workbuddyExe: "D:\\workbuddy\\WorkBuddy.exe"
+  # 加密会话文件（%LOCALAPPDATA%\\CodeBuddyExtension\\Data\\Public\\auth\\<id>.info）
+  # 留空 = 自动发现：排序是「**非备份优先** → mtime 最新」，所以只要桌面端主文件在，
+  # 它恒等于桌面端**当前登录**的那个账号（`clean()` 产生的备份永远不会被选中）。
+  # 需要固定用某个账号时，才在这里显式写绝对路径。
+  #
+  # 换账号有三种方式（推荐前两种，都不用手改这里）：
+  #   1. 管理台「账号」视图点「切换」 → 热生效
+  #   2. POST /__wb2api/accounts/switch {"file":"<绝对路径>"} → 热生效
+  #   3. 手写：改 `authFile` → `npm run creds export` → 重启服务
+  # 运行时选择记在 data/active-account.json；
+  # ⚠️ 但**这里显式写的路径优先级最高**，会覆盖运行时选择。
+  authFile: ""
+  # 静态密钥 / 会话缓存落盘目录
+  dataDir: data
+  # accessToken 剩余有效期低于该秒数就先续期
+  refreshBeforeSec: 600
+
+logging:
+  # 抓包日志（只记录元信息 + 截断 body，默认关）
+  capture: false
+  captureDir: logs
+  dir: logs
+
+models:
+  # 模型目录的两个来源（实测）：
+  #   1) 上游 /v3/config 只下发 37 个，且换 X-IDE-Version / base 域名都不变；
+  #   2) WorkBuddy 桌面端本地产品配置里有 48~52 个（数量随上游调整浮动），字段更全。
+  # 本服务把两者合并（本地为准、上游补齐），所以不再需要手抄整份模型清单。
+  #
+  # 关掉本地目录（只认上游 37 个）：useLocalCatalog: false 或环境变量 WB2API_NO_LOCAL_CATALOG=1
+  useLocalCatalog: true
+  # 留空 = 自动发现（%ACC_PRODUCT_CONFIG_PATH% → ~/.workbuddy/cache/acc-product-config-v3.json）
+  productConfigPath: ""
+  # 兜底候选：两个目录都没有、但网关实际可路由的 id。启动后逐个 1-token 探活，
+  # 探通才进 /v1/models；探不通的不显示。
+  #
+  # deepseek-v4.1-flash：网关可路由、但**不在上游 37 个里**，
+  # 且 2026-10-01 桌面端缓存重写后从本地目录里也消失了（缓存 52→48）。
+  # 因此靠这里兜底 —— 它是这个字段的正经用途，别当成历史遗留删掉。
+  # 可用环境变量覆盖：WB2API_EXTRA_MODELS（逗号分隔）
+  extraIds:
+    - deepseek-v4.1-flash
+  # 兜底条目的元数据。必须填 —— DSH 的「获取可用模型」只读 context_length /
+  # max_output_tokens / name；缺了会掉进它自己 262144 / 32768 的默认值。
+  # 数值取自桌面端产品配置（v4.1-flash 被撤下前实测：1M / 128K）。
+  extraMeta:
+    deepseek-v4.1-flash:
+      name: Deepseek-V4.1-Flash
+      contextLength: 1000000
+      maxOutputTokens: 128000
+      vendor: f
+      supportsImages: true
+      supportsTools: true
+      supportsReasoning: true
+  # 探活结果缓存时长（秒）
+  probeIntervalSec: 43200

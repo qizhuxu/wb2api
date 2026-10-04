@@ -1,0 +1,410 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+// interceptResponse ports the non-streaming half of V1/o.k() step 9 together
+// with the accounting of V1/o.r().
+//
+// Original failure path:
+//
+//	if resp.status >= 400 {
+//	    provider.f(bodyString, status)        // classify
+//	    engine.c(providerId, uid, kind, reason) // A0.s.p -> cooldown
+//	    accumulate reason; rotate credential
+//	}
+//	...
+//	engine.r(providerId, ..., usage, latency, request, response)   // book-keeping
+//
+// The response interceptor cannot rotate credentials (CPA owns that loop), but
+// it can (a) classify the upstream failure so the credential pool applies the
+// right cooldown and (b) record the call for the management status page.
+func interceptResponse(request []byte) ([]byte, error) {
+	var req pluginapi.ResponseInterceptRequest
+	if len(request) > 0 {
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
+
+	// The account is stamped on the *response* headers by the executor, because that is
+	// the only place it is known: the credential is chosen when the request is
+	// executed, after RequestHeaders have already been fixed. Reading only
+	// RequestHeaders is why the per-account tallies (成功/失败, 用量, 最近成功) were
+	// always empty — the id was never there to find.
+	ctx := resolveContext(req.RequestID, req.ResponseHeaders, req.Model, req.RequestedModel, req.Stream)
+	if ctx.UID == "" {
+		// Fall back to the request headers: an older host, or a body that carries the
+		// identity itself, still works.
+		ctx = resolveContext(req.RequestID, req.RequestHeaders, req.Model, req.RequestedModel, req.Stream)
+	}
+	statusCode := req.StatusCode
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+
+	// A caller hanging up is dropped here, before anything is written.
+	//
+	// It says nothing about the credential — the same account serves the next request —
+	// and it says nothing about the service either, since the person on the other end is
+	// the one who stopped it. Keeping it in the log only added rows the operator has to
+	// read past and decide to ignore; not recording it at all is the honest treatment.
+	// Nothing below this line runs, so the pool's cooldown logic never sees it either.
+	if isClientAbortFailure(statusCode, string(req.Body)) {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+
+	// Only this plugin's own traffic is recorded.
+	//
+	// Provider alone is not enough. A request whose model carries no "provider/" prefix
+	// falls back to the default provider during routing, so a grok or gpt-oss call is
+	// routed — and stamped — as if it were this plugin's; the header therefore says
+	// "codebuddy" for traffic that never touched these credentials. The model id is the
+	// one fact that cannot be faked that way: it either appears in the catalogue this
+	// plugin fetched from its own upstream, or it does not.
+	if !isWorkBuddyRecord(ctx.Provider) {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	// A catalogue that has not loaded yet is not grounds for dropping data — the answer
+	// is unknown, not "no".
+	if catalogueLoaded() && !ownsModel(ctx.Model) && !ownsModel(ctx.RequestedModel) {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+
+	// --- failure classification (V1/o.k step 9) ------------------------
+	if statusCode >= 400 {
+		upErr := classifyUpstream(statusCode, req.Body)
+		autoDisabled := false
+		if ctx.Provider != "" && !isRequestContentFailure(upErr.Message) {
+			// A credential the upstream has rejected as invalid will not start
+			// working on the next attempt, so the account is retired rather
+			// than merely cooled down. Everything else (429, quota exhaustion,
+			// 5xx) is recoverable and keeps its cooldown.
+			//
+			// A malformed request is excluded outright: it describes the
+			// conversation, not the credential, so retrying it elsewhere fails
+			// identically and counting it parked every account in turn.
+			permanent := isPermanentFailure(statusCode, upErr)
+			// Pass the model so a throttle parks only the model that was asked
+			// for. The upstream reports it per model and tells the caller to
+			// switch, so benching the account would also disable the models that
+			// still work.
+			autoDisabled = state.pool.failureForModel(ctx.Provider, ctx.UID, failedModelName(ctx),
+				upErr.Kind, upErr.Message, state.settings.get(), permanent)
+		}
+		errorText := upstreamErrText(upErr)
+		if autoDisabled {
+			// Folded into the same record: adding a second entry would count
+			// the failure twice in the totals.
+			errorText += "（已自动禁用该账号）"
+		}
+		// Say what the client should actually do.
+		//
+		// A throttle is scoped to one model, and whether another credential can
+		// take over depends on that model existing elsewhere. When it does not,
+		// the client sees "no auth available" and reads it as "the account is
+		// gone" — the wrong remedy entirely, since switching accounts cannot help
+		// and the reset time is the only thing that will.
+		if upErr.Kind == failureRate || upErr.Kind == failureQuota {
+			if detail := modelServabilityNote(failedModelName(ctx)); detail != "" {
+				errorText += detail
+			}
+		}
+		// The record is written by the usage hook, not here.
+		//
+		// CPA calls this interceptor only for a non-streaming response — the request type
+		// is documented as "describes a successful non-streaming response" — so its
+		// Stream field is false for everything that reaches it, and a streamed call never
+		// arrives at all. The usage hook fires for both and carries the authoritative
+		// flag (UsageRecord.Stream), so it owns the record; writing one here as well
+		// produced two rows for every buffered call, both labelled 非流式, which is what
+		// made the list look like it was mostly non-streaming traffic.
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+
+	// --- success accounting (V1/o.r) -----------------------------------
+	// Normalise once, and use the result everywhere the account is named: the log, the
+	// pool and the panel then agree on one identifier per account. Records written
+	// before this ran name the credential by CPA's runtime auth id, which is a different
+	// string for the same account.
+	accountKey := canonicalUID(ctx.UID)
+	if ctx.Provider != "" {
+		state.pool.success(ctx.Provider, accountKey)
+	}
+	// Only the pool success is recorded here. The call record comes from the usage hook,
+	// which sees streamed and buffered requests alike and knows which it was; see the note
+	// on the failure path above.
+	return okEnvelope(pluginapi.ResponseInterceptResponse{})
+}
+
+// modelServabilityNote explains whether switching accounts could serve a model.
+//
+// Returns an empty string when another credential is still eligible, because then
+// the ordinary "try again" advice is right and a note would only add noise. The
+// useful case is the opposite one: every credential that could take the request is
+// parked for this model, or the plugin no longer has a second one to offer.
+//
+// Whether a model exists on other credentials cannot be answered from here. The two
+// realms do not carry the same catalogue — the international one lists fewer models
+// than the domestic one — so a model may legitimately be single-sourced, and the
+// pool tracks eligibility, not catalogues. The note therefore states what has been
+// observed (no other credential can take it) without asserting why.
+func modelServabilityNote(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	if state.pool.anotherLaneCanServe(model) {
+		return ""
+	}
+	return fmt.Sprintf("（当前没有其它可用账号能接管该模型；请等待重置或改用其他模型）")
+}
+
+// interceptStreamChunk ports the streaming accounting path.
+//
+// V1/m (the APK's stream pump) inspects every SSE frame with V1/o.p(), pulling
+// out "usage", "error", and "choices[0].delta.content". Usage usually arrives
+// only on the final frame, so the totals are returned to the host on the
+// header-init call and accumulated per chunk.
+//
+// CPA calls this hook once with ChunkIndex == StreamChunkHeaderInitIndex before
+// any payload, then once per chunk.
+func interceptStreamChunk(request []byte) ([]byte, error) {
+	var req pluginapi.StreamChunkInterceptRequest
+	if len(request) > 0 {
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
+
+	ctx := resolveContext(req.RequestID, req.ResponseHeaders, req.Model, req.RequestedModel, true)
+	if ctx.UID == "" {
+		ctx = resolveContext(req.RequestID, req.RequestHeaders, req.Model, req.RequestedModel, true)
+	}
+	if ctx.Label == "" {
+		// The executor can also record the account against the request id before the
+		// response exists; the interceptor then finds it here rather than in a header.
+		if c, okCtx := inflight.get(req.RequestID); okCtx && c.UID != "" {
+			ctx.UID = c.UID
+			ctx.Label = c.Label
+			ctx.Variant = c.Variant
+		}
+	}
+
+	// Header-init: nothing to inspect, but remember the correlation context.
+	if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+		inflight.put(req.RequestID, ctx)
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
+
+	// Payload chunk: scan for usage and terminal errors.
+	payload := req.Body
+	if usage, okUsage := extractStreamUsage(payload); okUsage {
+		acc := accumulatorFor(req.RequestID)
+		acc.merge(usage)
+	}
+	if msg := extractStreamError(payload); msg != "" {
+		if ctx.Provider != "" {
+			upErr := classifyUpstream(http.StatusBadGateway, []byte(msg))
+			// Stream errors carry the same per-model throttle text, so scope the
+			// cooldown the same way instead of benching the whole account. A
+			// malformed request is skipped entirely: it is the client's to fix
+			// and would otherwise park every account that tried it.
+			if !isRequestContentFailure(upErr.Message) {
+				state.pool.failureForModel(ctx.Provider, ctx.UID, failedModelName(ctx),
+					upErr.Kind, upErr.Message, state.settings.get(), false)
+			}
+		}
+	}
+
+	return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+}
+
+// failedModelName picks the model id to attribute a failure to.
+//
+// RequestedModel is what the client asked for; Model is what the request was
+// resolved to. The cooldown has to be keyed by the name the *router* will look up
+// on the next attempt, which is the requested one, so it wins when both are set.
+func failedModelName(ctx requestContext) string {
+	if model := strings.TrimSpace(ctx.RequestedModel); model != "" {
+		return model
+	}
+	return strings.TrimSpace(ctx.Model)
+}
+
+// upstreamErrText renders the same shape the app logged, e.g.
+// "请求被上游拒绝（trae/acc-1）：invalid or expired token".
+func upstreamErrText(upErr upstreamError) string {
+	if upErr.Message == "" {
+		return "上游 HTTP " + http.StatusText(upErr.StatusCode)
+	}
+	return upErr.Message
+}
+
+// resolveAccountVariant reports which supplier realm served a request.
+//
+// The call log previously showed only Provider, which is the constant
+// "codebuddy" for both realms, so with a mixed pool there was no way to tell a
+// domestic call from an international one.
+//
+// Lookup order is cheapest-first and every step is best-effort: a log field is
+// not worth failing a request over, and an unresolved realm is reported as "—"
+// rather than guessed.
+func resolveAccountVariant(uid, label string) string {
+	if uid == "" && label == "" {
+		return ""
+	}
+	// 1. The pool knows a lane's realm once it has been observed.
+	for _, lane := range state.pool.snapshot() {
+		if lane.Variant == "" {
+			continue
+		}
+		if (uid != "" && (lane.UID == uid || laneKey(lane.Provider, lane.UID) == uid)) ||
+			(label != "" && lane.Label == label) {
+			return lane.Variant
+		}
+	}
+	// 2. Fall back to the account store, which derives the realm from the
+	//    credential itself (domain, then JWT issuer).
+	return variantForUID(uid, label)
+}
+
+// variantLabelOrDash renders a realm for display, using an em dash when unknown
+// so the column never shows an empty cell that reads as a rendering bug.
+func variantLabelOrDash(variant string) string {
+	switch variant {
+	case string(variantAi):
+		return "国际"
+	case string(variantCn):
+		return "国内"
+	}
+	return "—"
+}
+
+// resolveContext rebuilds the per-request context from the WorkBuddy headers the
+// request interceptor stamped, falling back to whatever CPA supplied.
+func resolveContext(requestID string, headers http.Header, model, requestedModel string, stream bool) requestContext {
+	var ctx requestContext
+	if c, okCtx := inflight.get(requestID); okCtx {
+		ctx = c
+	}
+
+	if provider := headerValue(headers, "X-WorkBuddy-Provider"); provider != "" {
+		ctx.Provider = provider
+	}
+	if m := headerValue(headers, "X-WorkBuddy-Model"); m != "" {
+		ctx.Model = m
+	} else if ctx.Model == "" {
+		ctx.Model = model
+	}
+	if rm := headerValue(headers, "X-WorkBuddy-Requested-Model"); rm != "" {
+		ctx.RequestedModel = rm
+	} else if ctx.RequestedModel == "" {
+		ctx.RequestedModel = requestedModel
+	}
+	if uid := headerValue(headers, "X-WorkBuddy-Auth-Id"); uid != "" {
+		ctx.UID = uid
+	}
+	if label := headerValue(headers, "X-WorkBuddy-Auth-Label"); label != "" {
+		ctx.Label = label
+	}
+	// The realm is a property of the credential, not of the request. Resolving it
+	// here means a log line says which supplier answered even though Provider is
+	// the same constant for both.
+	ctx.Variant = resolveAccountVariant(ctx.UID, ctx.Label)
+
+	// The explicit "provider/model" form is a second, header-independent source
+	// of truth (V1/o.k step 6).
+	if ctx.Provider == "" && ctx.Model != "" {
+		settings := state.settings.get()
+		if res, okRoute := resolveRoute(ctx.Model, settings, []string{settings.DefaultProvider}); okRoute {
+			ctx.Provider = res.Provider
+		}
+	}
+	if ctx.RequestedModel == "" {
+		ctx.RequestedModel = ctx.Model
+	}
+	ctx.Stream = stream
+	if ctx.StartedAt.IsZero() {
+		// Local, not UTC: these stamps are bucketed into hours and days and the labels
+		// are printed as-is, so they have to be wall-clock times in the operator's zone.
+		ctx.StartedAt = nowPanel()
+	}
+	return ctx
+}
+
+func elapsed(ctx requestContext) int64 {
+	if ctx.StartedAt.IsZero() {
+		return 0
+	}
+	return nowPanel().Sub(ctx.StartedAt).Milliseconds()
+}
+
+// extractUsage pulls the "usage" object out of a non-streaming response.
+func extractUsage(body []byte) (usagePayload, bool) {
+	if len(body) == 0 {
+		return usagePayload{}, false
+	}
+	var doc struct {
+		Usage *usagePayload `json:"usage"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &doc); errUnmarshal != nil {
+		return usagePayload{}, false
+	}
+	if doc.Usage == nil {
+		return usagePayload{}, false
+	}
+	return *doc.Usage, true
+}
+
+// isPermanentFailure reports whether a failure should retire the account.
+//
+// Retiring is a strong action: it takes the credential out of rotation until an
+// operator notices. It is therefore limited to the failures that provably cannot
+// fix themselves:
+//
+//	401 / 403 with an auth-class error -> the token is rejected outright;
+//	400 whose text names an invalid credential -> same, reported as bad request.
+//
+// Deliberately NOT permanent:
+//
+//	429                 -> rate limit, recovers on its own;
+//	402 / quota wording -> the balance may be topped up;
+//	5xx / timeouts      -> upstream problem, says nothing about the credential.
+//
+// Retiring on quota exhaustion was considered and rejected: running out of
+// credits is normally temporary, so it would permanently remove an account that
+// a top-up would have restored.
+func isPermanentFailure(statusCode int, upErr upstreamError) bool {
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return true
+	case http.StatusBadRequest:
+		// Some gateways answer 400 for a rejected credential. Only treat it as
+		// permanent when the text says so; a plain 400 is usually a bad request
+		// shape.
+		return upErr.Kind == failureAuth || mentionsInvalidCredential(upErr.Message)
+	}
+	return false
+}
+
+// mentionsInvalidCredential looks for the wording these gateways use when a
+// token is no longer accepted.
+func mentionsInvalidCredential(message string) bool {
+	lower := strings.ToLower(message)
+	for _, marker := range []string{
+		"invalid token", "invalid_token", "token expired", "token has expired",
+		"unauthorized", "未授权", "登录已过期", "凭据无效", "凭证无效",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}

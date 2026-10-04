@@ -1,0 +1,561 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+)
+
+// This file implements the WorkBuddy upstream client, ported from AI 聚合网关
+// 0.1.18 provider a2/b.
+//
+// Two endpoints matter:
+//
+//	listModels   GET  {q(domain)}/console/enterprises/personal/models   (a2/b.java:745 w())
+//	chat         POST {q(domain)}/v2/chat/completions                   (a2/b.java:335 b())
+//
+// Bot hahs the same base selection (a2/b.java:716 q()):
+//
+//	domain == "global" ? "https://www.workbuddy.ai" : "https://copilot.tencent.com"
+//
+// and the same header set (a2/b.java:720 r()).
+//
+// Importantly, /v2/chat/completions already speaks the OpenAI Chat Completions
+// protocol, so no request/response translation layer is required — the client
+// body is forwarded with only the model name normalised.
+
+const (
+	// workBuddyModelsPath is the model catalogue endpoint.
+	//
+	// Measured against the live service: /v2/... answers 401 (exists, needs
+	// auth) on both realms, while the /console/... form answers 500 on the
+	// international host. A non-2xx response makes the caller fall back to the
+	// built-in catalogue, so the wrong path silently replaced the real model
+	// list with five hard-coded entries.
+	workBuddyModelsPath = "/v2/enterprises/personal/models"
+	// workBuddyChatPath is the OpenAI-compatible chat endpoint (a2/b.java:335).
+	workBuddyChatPath = "/v2/chat/completions"
+	// workBuddyCLIAgentName is the agent whose model list acts as a whitelist.
+	workBuddyCLIAgentName = "cli"
+)
+
+// workBuddyUpstreamError carries the upstream status so the executor can decide
+// whether the failure is worth rotating credentials over.
+type workBuddyUpstreamError struct {
+	StatusCode int
+	Message    string
+	Body       []byte
+}
+
+func (e *workBuddyUpstreamError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("上游 HTTP %d", e.StatusCode)
+}
+
+// workBuddyModel is one entry of the model catalogue (a2/b.java w() -> q(8,...)).
+//
+// The first three fields are what the source app read; the rest is the same
+// response carrying the capability metadata modelsToInfo needs. Without it CPA
+// can advertise only an id and a context window, and a client cannot learn that
+// a model accepts images or thinks.
+type workBuddyModel struct {
+	ID             string
+	DisplayName    string
+	MaxInputTokens int64
+	// MaxAllowedSize is the context-window fallback: some entries leave
+	// MaxInputTokens at 0 and set only this.
+	MaxAllowedSize int64
+	// MaxOutputTokens caps generated tokens.
+	MaxOutputTokens    int64
+	SupportsImages     bool
+	DisabledMultimodal bool
+	SupportsReasoning  bool
+	// OnlyReasoning means the model cannot run without thinking.
+	OnlyReasoning bool
+	// Reasoning is nil when the catalogue entry has no reasoning block.
+	Reasoning        *workBuddyReasoning
+	SupportsToolCall bool
+	IsDefault        bool
+	Vendor           string
+}
+
+// workBuddyReasoning is the catalogue's reasoning block.
+//
+// The pointer fields distinguish "absent" from "false": a missing
+// canDisableThinking correctly means "cannot disable", while a missing
+// supportedEfforts must not be read as "no levels at all".
+type workBuddyReasoning struct {
+	Effort             *string  `json:"effort"`
+	DefaultEffort      *string  `json:"defaultEffort"`
+	SupportedEfforts   []string `json:"supportedEfforts"`
+	CanDisableThinking *bool    `json:"canDisableThinking"`
+}
+
+// acceptsImages reports whether the model should be advertised as accepting
+// image input. The DisabledMultimodal check is load-bearing: several entries
+// carry supportsImages=true with disabledMultimodal=true, and advertising those
+// as vision models promises what the upstream refuses.
+func (m workBuddyModel) acceptsImages() bool {
+	return m.SupportsImages && !m.DisabledMultimodal
+}
+
+// contextWindow is the effective input limit, falling back to MaxAllowedSize.
+func (m workBuddyModel) contextWindow() int64 {
+	if m.MaxInputTokens > 0 {
+		return m.MaxInputTokens
+	}
+	return m.MaxAllowedSize
+}
+
+// workBuddyClient performs the upstream calls.
+type workBuddyClient struct {
+	httpClient *http.Client
+}
+
+func newWorkBuddyClient() *workBuddyClient {
+	return &workBuddyClient{
+		httpClient: &http.Client{
+			// No global timeout: streaming responses are long-lived. Connection
+			// establishment and header reads are bounded instead.
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: 60 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+			},
+		},
+	}
+}
+
+var workBuddyUpstream = newWorkBuddyClient()
+
+// ---- models ---------------------------------------------------------------
+
+// listModels ports a2/b.java w(): fetch and filter the provider model catalogue.
+//
+// Filtering rules, in the original order:
+//
+//  1. id must be non-empty
+//  2. id must not already have been seen
+//  3. if the "cli" agent declares a model list, id must be in it
+//  4. disabled must not be true
+//
+// DisplayName falls back to id when the provider omits "name"; MaxInputTokens
+// comes from "maxInputTokens".
+func (c *workBuddyClient) listModels(ctx context.Context, creds *workBuddyCredentials) ([]workBuddyModel, error) {
+	if creds == nil || creds.AccessToken == "" {
+		return nil, errors.New("缺少访问令牌")
+	}
+
+	endpoint := workBuddyBaseURL(creds.Domain) + workBuddyModelsPath
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if errRequest != nil {
+		return nil, errRequest
+	}
+	applyWorkBuddyHeaders(req.Header, creds)
+
+	resp, errDo := c.httpClient.Do(req)
+	if errDo != nil {
+		return nil, fmt.Errorf("模型接口请求失败: %w", errDo)
+	}
+	defer resp.Body.Close()
+
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if errRead != nil {
+		return nil, fmt.Errorf("读取模型响应失败: %w", errRead)
+	}
+
+	// a2/b.java w(): "模型接口 HTTP <code>"
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &workBuddyUpstreamError{
+			StatusCode: resp.StatusCode,
+			Message:    fmt.Sprintf("模型接口 HTTP %d", resp.StatusCode),
+			Body:       body,
+		}
+	}
+	return parseWorkBuddyModels(body)
+}
+
+// parseWorkBuddyModels implements the catalogue parsing of a2/b.java w().
+func parseWorkBuddyModels(body []byte) ([]workBuddyModel, error) {
+	var doc struct {
+		Code *int `json:"code"`
+		Data *struct {
+			Agents []struct {
+				Name   string   `json:"name"`
+				Models []string `json:"models"`
+			} `json:"agents"`
+			Models []struct {
+				ID                 string              `json:"id"`
+				Name               string              `json:"name"`
+				MaxInputTokens     int64               `json:"maxInputTokens"`
+				MaxAllowedSize     int64               `json:"maxAllowedSize"`
+				MaxOutputTokens    int64               `json:"maxOutputTokens"`
+				Disabled           bool                `json:"disabled"`
+				SupportsImages     bool                `json:"supportsImages"`
+				DisabledMultimodal bool                `json:"disabledMultimodal"`
+				SupportsReasoning  bool                `json:"supportsReasoning"`
+				OnlyReasoning      bool                `json:"onlyReasoning"`
+				SupportsToolCall   bool                `json:"supportsToolCall"`
+				IsDefault          bool                `json:"isDefault"`
+				Vendor             string              `json:"vendor"`
+				Reasoning          *workBuddyReasoning `json:"reasoning"`
+			} `json:"models"`
+		} `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &doc); errUnmarshal != nil {
+		// a2/b.java: "模型响应不是合法 JSON"
+		return nil, errors.New("模型响应不是合法 JSON")
+	}
+	// a2/b.java: code must be present and zero.
+	if doc.Code == nil || *doc.Code != 0 {
+		code := "<nil>"
+		if doc.Code != nil {
+			code = fmt.Sprint(*doc.Code)
+		}
+		return nil, errors.New("模型接口 code=" + code)
+	}
+	if doc.Data == nil {
+		// a2/b.java returns an empty list when data is absent.
+		return nil, nil
+	}
+
+	// The "cli" agent's model list is a preference hint, not a hard filter.
+	//
+	// It was originally treated as a whitelist, which silently dropped models
+	// the provider had added but not yet listed under the "cli" agent — the
+	// user's `deepseek-v4.1-flash` disappeared exactly this way, and an
+	// unlisted model then failed routing with "unknown provider for model".
+	//
+	// The list is now used only to ORDER the catalogue (cli models first), and
+	// every enabled model the provider returns is kept.
+	// The "cli" agent's model list is a preference hint, not a hard filter.
+	//
+	// It was originally treated as a whitelist, which silently dropped models
+	// the provider had added but not yet listed under the "cli" agent — the
+	// user's `deepseek-v4.1-flash` disappeared exactly this way, and an
+	// unlisted model then failed routing with "unknown provider for model".
+	//
+	// Every agent's models are kept; the cli agent's order is used only to rank
+	// the catalogue.
+	cliPreferred := make(map[string]int)
+	agentIDs := make(map[string]int)
+	agentOrder := make([]string, 0)
+	for _, agent := range doc.Data.Agents {
+		for _, id := range agent.Models {
+			if id == "" {
+				continue
+			}
+			if _, exists := agentIDs[id]; !exists {
+				agentIDs[id] = len(agentOrder)
+				agentOrder = append(agentOrder, id)
+			}
+			if agent.Name == workBuddyCLIAgentName {
+				if _, exists := cliPreferred[id]; !exists {
+					cliPreferred[id] = len(cliPreferred)
+				}
+			}
+		}
+	}
+
+	seen := make(map[string]struct{})
+	out := make([]workBuddyModel, 0, len(doc.Data.Models)+len(agentOrder))
+	for _, m := range doc.Data.Models {
+		id := m.ID
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		if m.Disabled {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		display := m.Name
+		if display == "" {
+			display = id
+		}
+		out = append(out, workBuddyModel{
+			ID:                 id,
+			DisplayName:        display,
+			MaxInputTokens:     m.MaxInputTokens,
+			MaxAllowedSize:     m.MaxAllowedSize,
+			MaxOutputTokens:    m.MaxOutputTokens,
+			SupportsImages:     m.SupportsImages,
+			DisabledMultimodal: m.DisabledMultimodal,
+			SupportsReasoning:  m.SupportsReasoning,
+			OnlyReasoning:      m.OnlyReasoning,
+			Reasoning:          m.Reasoning,
+			SupportsToolCall:   m.SupportsToolCall,
+			IsDefault:          m.IsDefault,
+			Vendor:             m.Vendor,
+		})
+	}
+
+	// Fall back to the agent listing when the flat catalogue is absent.
+	//
+	// The two deployments differ: one returns data.models[] with display names
+	// and context windows, the other exposes only data.agents[].models[] as a
+	// list of ids (which is what the reference implementation reads). Reading
+	// only data.models[] therefore yielded an empty catalogue on the host that
+	// uses the agent shape, and the caller silently replaced the real list with
+	// the built-in fallback — so the panel showed five fixed models that the
+	// account may not even serve.
+	if len(out) == 0 && len(agentOrder) > 0 {
+		ids := append([]string(nil), agentOrder...)
+		for _, id := range ids {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, workBuddyModel{
+				ID:             id,
+				DisplayName:    id,
+				MaxInputTokens: fallbackModelContextWindow,
+			})
+		}
+	}
+
+	// Order the catalogue so cli-listed models come first, preserving their
+	// declared order. Models the provider added without listing them under the
+	// "cli" agent follow, in the order the provider returned them.
+	sort.SliceStable(out, func(i, j int) bool {
+		oi, iIsCLI := cliPreferred[out[i].ID]
+		oj, jIsCLI := cliPreferred[out[j].ID]
+		switch {
+		case iIsCLI && jIsCLI:
+			return oi < oj
+		case iIsCLI:
+			return true
+		case jIsCLI:
+			return false
+		}
+		return false
+	})
+	return out, nil
+}
+
+// ---- chat -----------------------------------------------------------------
+
+// normalizeWorkBuddyModel ports a2/b.java k():
+//
+//	String obj = trim(requested);
+//	return (obj.isEmpty() || obj.equals("auto"))
+//	    ? <configured default model>
+//	    : obj;
+//
+// The configured default falls back to the first available model when the
+// operator has not set one, which keeps "auto" usable.
+func normalizeWorkBuddyModel(requested string, defaultModel string) string {
+	trimmed := strings.TrimSpace(requested)
+	if trimmed == "" || trimmed == "auto" {
+		return strings.TrimSpace(defaultModel)
+	}
+	return trimmed
+}
+
+// rewriteChatModel replaces the "model" field of a chat-completions body while
+// preserving every other field verbatim.
+func rewriteChatModel(body []byte, model string) ([]byte, error) {
+	if model == "" {
+		return body, nil
+	}
+	var doc map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(body, &doc); errUnmarshal != nil {
+		return nil, fmt.Errorf("请求体不是合法 JSON: %w", errUnmarshal)
+	}
+	encoded, errMarshal := json.Marshal(model)
+	if errMarshal != nil {
+		return nil, errMarshal
+	}
+	doc["model"] = encoded
+	return json.Marshal(doc)
+}
+
+// chatCompletions posts a chat request upstream and returns the raw
+// OpenAI-shaped response.
+//
+// The caller gets the status code alongside the body so a non-2xx response can
+// be surfaced without losing the upstream error detail.
+func (c *workBuddyClient) chatCompletions(ctx context.Context, creds *workBuddyCredentials, body []byte) (int, http.Header, []byte, error) {
+	if creds == nil || creds.AccessToken == "" {
+		return 0, nil, nil, errors.New("缺少访问令牌")
+	}
+
+	endpoint := workBuddyBaseURL(creds.Domain) + workBuddyChatPath
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if errRequest != nil {
+		return 0, nil, nil, errRequest
+	}
+	applyWorkBuddyHeaders(req.Header, creds)
+
+	resp, errDo := c.httpClient.Do(req)
+	if errDo != nil {
+		return 0, nil, nil, fmt.Errorf("上游请求失败: %w", errDo)
+	}
+	defer resp.Body.Close()
+
+	respBody, errRead := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if errRead != nil {
+		return resp.StatusCode, resp.Header, nil, fmt.Errorf("读取上游响应失败: %w", errRead)
+	}
+	return resp.StatusCode, resp.Header, respBody, nil
+}
+
+// chatCompletionsStream posts a streaming chat request and invokes onChunk for
+// every SSE frame.
+//
+// The upstream already emits OpenAI-style SSE (`data: {...}` / `data: [DONE]`),
+// so frames are forwarded verbatim. onChunk returning an error aborts the read.
+func (c *workBuddyClient) chatCompletionsStream(
+	ctx context.Context,
+	creds *workBuddyCredentials,
+	body []byte,
+	onChunk func([]byte) error,
+) (int, http.Header, error) {
+	if creds == nil || creds.AccessToken == "" {
+		return 0, nil, errors.New("缺少访问令牌")
+	}
+
+	endpoint := workBuddyBaseURL(creds.Domain) + workBuddyChatPath
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if errRequest != nil {
+		return 0, nil, errRequest
+	}
+	applyWorkBuddyHeaders(req.Header, creds)
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, errDo := c.httpClient.Do(req)
+	if errDo != nil {
+		return 0, nil, fmt.Errorf("上游请求失败: %w", errDo)
+	}
+	defer resp.Body.Close()
+
+	// Non-2xx: drain a bounded amount so the error text can be reported, then
+	// hand the status back for classification.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return resp.StatusCode, resp.Header, &workBuddyUpstreamError{
+			StatusCode: resp.StatusCode,
+			Message:    extractUpstreamMessage(errBody, resp.StatusCode),
+			Body:       errBody,
+		}
+	}
+
+	reader := bufio.NewReaderSize(resp.Body, 64<<10)
+	for {
+		line, errRead := readLineWithIdleTimeout(ctx, reader, resp.Body)
+		if len(line) > 0 {
+			if errChunk := onChunk(line); errChunk != nil {
+				return resp.StatusCode, resp.Header, errChunk
+			}
+		}
+		if errRead != nil {
+			if errors.Is(errRead, io.EOF) {
+				return resp.StatusCode, resp.Header, nil
+			}
+			return resp.StatusCode, resp.Header, fmt.Errorf("读取上游流失败: %w", errRead)
+		}
+	}
+}
+
+// Stream read deadlines.
+//
+// http.Client.Timeout cannot be used here: it would cap the whole exchange, and a
+// reasoning model legitimately takes minutes to finish. What has to be bounded
+// instead is the gap *between* bytes:
+//
+//	firstByteTimeout — from the moment the body starts being read until the
+//	                   first line arrives. Upstream sends headers as soon as it
+//	                   starts working, so a long silence here means the request
+//	                   is not going to be answered.
+//	idleLineTimeout  — the longest acceptable pause between two SSE lines once
+//	                   the stream is running.
+//
+// Without these two the read loop blocks forever on a half-open connection: the
+// response header arrives, then upstream goes quiet, and nothing ever unblocks
+// `ReadBytes`. The client eventually gives up and the plugin goroutine leaks.
+const (
+	firstByteTimeout = 6 * time.Minute
+	idleLineTimeout  = 3 * time.Minute
+)
+
+// readLineWithIdleTimeout reads one line, bounding the wait before the first
+// byte more generously than the wait between subsequent lines.
+//
+// The deadline is enforced by reading in a goroutine and abandoning it on
+// timeout: net/http gives no per-read deadline, and the buffered reader has no
+// cancelable read. The abandoned goroutine exits once the body is closed, which
+// the caller does via defer when it returns an error.
+func readLineWithIdleTimeout(ctx context.Context, reader *bufio.Reader, body io.ReadCloser) ([]byte, error) {
+	timeout := idleLineTimeout
+	if !readerHasBufferedData(reader) {
+		timeout = firstByteTimeout
+	}
+
+	type readResult struct {
+		line  []byte
+		err   error
+		first bool
+	}
+	done := make(chan readResult, 1)
+	// Track whether this is the very first read so the timeout above applies to
+	// the right silence.
+	go func() {
+		line, errRead := reader.ReadBytes('\n')
+		done <- readResult{line: line, err: errRead}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case res := <-done:
+		return res.line, res.err
+	case <-timer.C:
+		// Unblock the reader so the goroutine can exit rather than leak.
+		_ = body.Close()
+		return nil, fmt.Errorf("上游 %s 内未返回数据，连接可能已中断", timeout)
+	case <-ctx.Done():
+		_ = body.Close()
+		return nil, ctx.Err()
+	}
+}
+
+// readerHasBufferedData reports whether the reader already holds bytes, which
+// means the stream has produced output and the shorter idle timeout applies.
+func readerHasBufferedData(reader *bufio.Reader) bool {
+	return reader != nil && reader.Buffered() > 0
+}
+
+// extractUpstreamMessage pulls a human-readable message out of an error body,
+// accepting the OpenAI shape and WorkBuddy's own {"msg":...} envelope.
+func extractUpstreamMessage(body []byte, statusCode int) string {
+	var doc struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Msg     string `json:"msg"`
+		Message string `json:"message"`
+	}
+	if len(body) > 0 {
+		if errUnmarshal := json.Unmarshal(body, &doc); errUnmarshal == nil {
+			for _, candidate := range []string{doc.Error.Message, doc.Msg, doc.Message} {
+				if strings.TrimSpace(candidate) != "" {
+					return strings.TrimSpace(candidate)
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("上游 HTTP %d", statusCode)
+}

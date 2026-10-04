@@ -1,0 +1,37 @@
+# wb2api 容器编排
+#
+#   启动：docker compose up -d
+#   管理台：http://127.0.0.1:18788/ui/
+#   日志：docker compose logs -f
+#
+# ⚠️ 首次启动前必须先灌凭证（容器内没有 WorkBuddy.exe，解不了桌面端会话文件）：
+#     把本机 Windows 上的 data/wb-session.json 复制到 ./data/ 再起容器。
+#     之后由 refreshToken 自动续期，无需再碰桌面端。
+services:
+  wb2api:
+    build: .
+    # 有发布镜像时可直接用：image: ghcr.io/<owner>/wb2api:latest
+    image: wb2api:local
+    container_name: wb2api
+    restart: unless-stopped
+    ports:
+      # 默认只绑回环：本服务没有鉴权，别不小心暴露到局域网/公网。
+      # 确实要让同网段访问，改成 "0.0.0.0:18788:18788" 并自行加鉴权层。
+      - "127.0.0.1:18788:18788"
+    volumes:
+      # 凭证 / 密钥缓存（含 at-rest-key.json 与 wb-session.json）—— 必须持久化
+      - ./data:/app/data
+      # 日志
+      - ./logs:/app/logs
+      # 配置只读挂载，改完 docker compose restart 生效
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      # 容器内必须绑 0.0.0.0，否则端口映射进不来
+      WB2API_HOST: "0.0.0.0"
+      WB2API_PORT: "18788"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18788/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

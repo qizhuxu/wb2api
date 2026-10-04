@@ -1,0 +1,558 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+const (
+	// pluginName is the plugin's identifier, and it has to stay directory-safe.
+	//
+	// CPA derives the routes from it — /v0/management/<pluginName>,
+	// /v0/resource/plugins/<pluginName> — and the plugin resolves its data directory
+	// with it. Changing this would break every request the panel makes and orphan the
+	// stored configuration, so it is not a label.
+	pluginName = "workbuddy"
+	// pluginDisplayName is what a person reads.
+	//
+	// CPA shows Metadata.Name in the authorisation page, where it is interpolated into
+	// sentences like "通过插件提供的 OAuth 流程登录 {{name}}". The identifier above is
+	// lower-case because it has to be; this is the name that appears in prose, so it
+	// carries the product's capitalisation.
+	pluginDisplayName = "WorkBuddy"
+	// 0.2.0 — this fork adds thinking injection and model capability
+	// declaration on top of upstream 0.1.3, so the minor version moves.
+	pluginVersion = "0.2.0"
+	pluginAuthor  = "BlackHawk"
+	pluginRepo        = "https://github.com/router-for-me/CLIProxyAPI"
+)
+
+// envelope is the CPA RPC envelope:
+//
+//	{"ok":true,"result":{...}}  |  {"ok":false,"error":{"code","message","http_status"}}
+type envelope struct {
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *envelopeError  `json:"error,omitempty"`
+}
+
+type envelopeError struct {
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	Retryable  bool   `json:"retryable,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+}
+
+// errorEnvelope builds a failure envelope. httpStatus defaults to 500 the same
+// way CPA's pluginabi.NewErrorEnvelope treats a zero status.
+func errorEnvelope(code, message string, httpStatus int) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: httpStatus,
+	}})
+	return raw
+}
+
+// okEnvelope wraps a value in the CPA success envelope.
+func okEnvelope(v any) ([]byte, error) {
+	raw, errMarshal := json.Marshal(v)
+	if errMarshal != nil {
+		return nil, errMarshal
+	}
+	return json.Marshal(envelope{OK: true, Result: json.RawMessage(raw)})
+}
+
+// identifierResponse answers every *.identifier method.
+type identifierResponse struct {
+	Identifier string `json:"identifier"`
+}
+
+// registration mirrors pluginhost.rpcRegistration.
+type registration struct {
+	SchemaVersion uint32             `json:"schema_version"`
+	Metadata      pluginapi.Metadata `json:"metadata"`
+	Capabilities  registrationCaps   `json:"capabilities"`
+}
+
+// registrationCaps mirrors pluginhost.rpcCapabilities. Only the fields this
+// plugin sets are declared; the rest default to false/empty.
+type registrationCaps struct {
+	AuthProvider                  bool `json:"auth_provider"`
+	FrontendAuthProvider          bool `json:"frontend_auth_provider"`
+	FrontendAuthProviderExclusive bool `json:"frontend_auth_provider_exclusive"`
+	RequestInterceptor            bool `json:"request_interceptor"`
+	ResponseInterceptor           bool `json:"response_interceptor"`
+	StreamChunkInterceptor        bool `json:"response_stream_interceptor"`
+	UsagePlugin                   bool `json:"usage_plugin"`
+	ManagementAPI                 bool `json:"management_api"`
+
+	// Model catalogue + execution. These make WorkBuddy's models visible in
+	// /v1/models and callable through /v1/chat/completions.
+	//
+	// ModelRegistrar and ModelProvider are two routes to the same catalogue and
+	// the official simple example declares both:
+	//
+	//	model.register       (ModelRegistrar) — the host calls it once at
+	//	                     startup and the plugin answers with its catalogue.
+	//	model.static /       (ModelProvider)  — the host asks on demand; with
+	//	model.for_auth                       both scopes set, it may also ask
+	//	                     per credential.
+	//
+	// Declaring only ModelProvider works, but the host then has no catalogue
+	// until it asks, so a startup-time registration pass sees nothing to
+	// publish. Declaring both lets either path populate the registry.
+	ModelRegistrar        bool     `json:"model_registrar"`
+	ModelProvider         bool     `json:"model_provider"`
+	ModelRouter           bool     `json:"model_router"`
+	Executor              bool     `json:"executor"`
+	ExecutorModelScope    string   `json:"executor_model_scope"`
+	ExecutorInputFormats  []string `json:"executor_input_formats"`
+	ExecutorOutputFormats []string `json:"executor_output_formats"`
+
+	// QuotaProvider surfaces the remaining-credit figure the source app showed
+	// ("已知额度合计", N1/R0.java:134).
+	QuotaProvider bool `json:"quota_provider"`
+
+	// Scheduler lets the plugin choose which credential a request uses, which
+	// is what makes the account-switching strategy configurable.
+	Scheduler bool `json:"scheduler"`
+}
+
+// managementRegistrationResponse mirrors pluginhost.rpcManagementRegistrationResponse.
+type managementRegistrationResponse struct {
+	Routes    []pluginapi.ManagementRoute `json:"routes,omitempty"`
+	Resources []pluginapi.ResourceRoute   `json:"resources,omitempty"`
+}
+
+// handleMethod dispatches one CPA RPC call.
+func handleMethod(method string, request []byte) ([]byte, error) {
+	switch method {
+
+	// ---- lifecycle ----------------------------------------------------
+	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		var req lifecycleRequest
+		if len(request) > 0 {
+			if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+				return nil, errUnmarshal
+			}
+		}
+		if errDecode := state.settings.decodeLifecycleConfig(req.ConfigYAML); errDecode != nil {
+			return nil, errDecode
+		}
+		// Bring up the background schedulers so the configured cadences are
+		// honoured for the lifetime of this plugin instance.
+		if state.settings.get().Checkin.Enabled {
+			startCheckinScheduler()
+		}
+		// The quota loop also performs the startup refresh, which is unconditional —
+		// the credit readings are the panel's main table, so it is always started.
+		startQuotaScheduler()
+		if state.settings.get().Growth.Enabled {
+			startGrowthScheduler()
+		}
+		startTaskScheduler()
+		// Restore credentials parked for a throttle once their deadline passes.
+		// Started unconditionally: a parked credential is a correctness problem,
+		// not a feature the operator opts into.
+		startParkRecovery()
+		return okEnvelope(buildRegistration())
+
+	case pluginabi.MethodPluginQuiesce:
+		// Acknowledge: nothing to drain, CPA owns the request lifecycle.
+		return okEnvelope(map[string]any{})
+
+	case pluginabi.MethodPluginShutdown:
+		shutdownPlugin()
+		return okEnvelope(map[string]any{})
+
+	// ---- WorkBuddy / codebuddy login (port of N1/B + V1/k) ------------
+	case pluginabi.MethodAuthIdentifier:
+		return authIdentifier()
+
+	case pluginabi.MethodAuthParse:
+		return authParse(request)
+
+	case pluginabi.MethodAuthLoginStart:
+		return authLoginStart(request)
+
+	case pluginabi.MethodAuthLoginPoll:
+		return authLoginPoll(request)
+
+	case pluginabi.MethodAuthRefresh:
+		return authRefresh(request)
+
+	// ---- model catalogue (port of a2/b.java:745 w()) -------------------
+	//
+	// model.register and model.static return the same catalogue through two
+	// host-driven paths; the official simple example implements both so either
+	// one can populate the registry. They share the implementation here for the
+	// same reason.
+	case pluginabi.MethodModelRegister:
+		return modelStatic(request)
+
+	case pluginabi.MethodModelStatic:
+		return modelStatic(request)
+
+	case pluginabi.MethodModelForAuth:
+		return modelForAuth(request)
+
+	// ---- request routing (port of V1/o.k step 6) -----------------------
+	case pluginabi.MethodModelRoute:
+		return modelRoute(request)
+
+	// ---- upstream execution (port of a2/b.java:335 b()) ----------------
+	case pluginabi.MethodExecutorIdentifier:
+		return executorIdentifier()
+
+	case pluginabi.MethodExecutorExecute:
+		return executorExecute(request)
+
+	case pluginabi.MethodExecutorExecuteStream:
+		return executorExecuteStream(request)
+
+	case pluginabi.MethodExecutorCountTokens:
+		return executorCountTokens(request)
+
+	case pluginabi.MethodExecutorHTTPRequest:
+		return executorHTTPRequest(request)
+
+	// ---- account selection strategy ------------------------------------
+	case pluginabi.MethodSchedulerPick:
+		return schedulerPick(request)
+
+	// ---- quota (port of a2/b.java:406 m()) -----------------------------
+	case pluginabi.MethodQuotaIdentifier:
+		return quotaIdentifier()
+
+	case pluginabi.MethodQuotaDescribe:
+		return quotaDescribe()
+
+	case pluginabi.MethodQuotaFetch:
+		return quotaFetch(request)
+
+	case pluginabi.MethodQuotaReset:
+		return quotaReset()
+
+	// ---- frontend auth (port of V1/o.j) -------------------------------
+	//
+	// This one is a routing key, not a label: CPA mounts the client-API-key gate
+	// at /v0/resource/plugins/<pluginName>, so it must stay the plugin's
+	// directory-safe name.
+	case pluginabi.MethodFrontendAuthIdentifier:
+		return okEnvelope(identifierResponse{Identifier: pluginName})
+
+	case pluginabi.MethodFrontendAuthAuthenticate:
+		return frontendAuth(request)
+
+	// ---- request interception (port of V1/o.k steps 6-8) --------------
+	case pluginabi.MethodRequestInterceptBefore:
+		return interceptRequest(request, false)
+
+	case pluginabi.MethodRequestInterceptAfter:
+		return interceptRequest(request, true)
+
+	// ---- response / stream interception (failure classification) ------
+	case pluginabi.MethodResponseInterceptAfter:
+		return interceptResponse(request)
+
+	case pluginabi.MethodResponseInterceptStreamChunk:
+		return interceptStreamChunk(request)
+
+	// ---- usage accounting (port of V1/o.r) ---------------------------
+	case pluginabi.MethodUsageHandle:
+		return handleUsage(request)
+
+	// ---- management API (port of V1.s + A0.s status surface) ---------
+	case pluginabi.MethodManagementRegister:
+		return okEnvelope(managementRegistration())
+
+	case pluginabi.MethodManagementHandle:
+		return handleManagement(request)
+
+	default:
+		return errorEnvelope("unknown_method", "unknown method: "+method, http.StatusNotImplemented), nil
+	}
+}
+
+func buildRegistration() registration {
+	return registration{
+		SchemaVersion: pluginabi.SchemaVersion,
+		Metadata: pluginapi.Metadata{
+			Name:             pluginDisplayName,
+			Version:          pluginVersion,
+			Author:           pluginAuthor,
+			GitHubRepository: pluginRepo,
+			ConfigFields: []pluginapi.ConfigField{
+				{Name: "port", Type: pluginapi.ConfigFieldTypeInteger, Description: "Original gateway listen port (reported for parity; CPA owns the listener)."},
+				{Name: "api_key", Type: pluginapi.ConfigFieldTypeString, Description: "Client bearer token required on inbound requests (V1/o.j)."},
+				{Name: "allow_no_key", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Allow requests without an Authorization header (V1/s.allowNoKey). Only used when enforce_frontend_key is on."},
+				{Name: "enforce_frontend_key", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Check the client bearer token in this plugin. Leave off so CPA's own api-keys keep working."},
+				{Name: "variant_override", Type: pluginapi.ConfigFieldTypeString, Description: "供应商切换 / supplier scope: cn = domestic accounts only, ai = international accounts only, empty = all suppliers. Scopes which accounts an operation acts on; it never changes an account's own realm."},
+				{Name: "expose_lan", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Reported for parity (V1/s.exposeLan)."},
+				{Name: "only_usable_models", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Hide models whose provider marks them unavailable (V1/s.onlyUsableModels)."},
+				{Name: "refresh_skew_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Refresh credentials this far ahead of expiry (V1/s.refreshSkewSeconds)."},
+				{Name: "max_rotate", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum credential rotations per request (V1/s.maxRotate)."},
+				{Name: "quota_cooldown_millis", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard cooldown after an auth/rate/quota rejection (V1/s.quotaCooldownMillis)."},
+				{Name: "soft_cooldown_millis", Type: pluginapi.ConfigFieldTypeInteger, Description: "Soft cooldown after a transient failure (V1/s.softCooldownMillis)."},
+				{Name: "error_threshold", Type: pluginapi.ConfigFieldTypeInteger, Description: "Consecutive failures before parking a credential (V1/s.errorThreshold)."},
+				{Name: "error_cooldown_millis", Type: pluginapi.ConfigFieldTypeInteger, Description: "Park duration once error_threshold is reached (V1/s.errorCooldownMillis)."},
+				{Name: "log_retention_days", Type: pluginapi.ConfigFieldTypeInteger, Description: "Retention window for the call log (V1/s.logRetentionDays)."},
+				{Name: "default_provider", Type: pluginapi.ConfigFieldTypeString, Description: "Provider used when the model carries no \"provider/model\" prefix (V1/s.defaultProvider)."},
+				{Name: "default_model", Type: pluginapi.ConfigFieldTypeString, Description: "Model used when the client asks for \"auto\" or omits the model (a2/b.java k())."},
+				{Name: "enforce_default_provider", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Reject models that address a provider other than default_provider."},
+				{Name: "reasoning_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Inject the upstream thinking parameter (top-level reasoning_effort). On by default: without it the upstream does not think at all. Turn off for raw passthrough, or when a small max_tokens makes thinking consume the whole budget."},
+				{Name: "reasoning_effort", Type: pluginapi.ConfigFieldTypeString, Description: "Thinking level injected when the client expressed none: minimal / low / medium / high / xhigh / max. A client's own effort always wins. \"max\" can leave short requests with an empty body, which is why the default is high."},
+				{Name: "debug", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Emit verbose plugin logging."},
+			},
+		},
+		Capabilities: registrationCaps{
+			AuthProvider:                  true,
+			FrontendAuthProvider:          true,
+			FrontendAuthProviderExclusive: false,
+			RequestInterceptor:            true,
+			ResponseInterceptor:           true,
+			StreamChunkInterceptor:        true,
+			UsagePlugin:                   true,
+			ManagementAPI:                 true,
+
+			// WorkBuddy credits drive the account selection order.
+			QuotaProvider: true,
+			// Lets the panel switch between by-credits / round-robin / random.
+			Scheduler: true,
+
+			// Both model routes are declared, as the official simple example
+			// does: model.register lets a startup pass publish the catalogue,
+			// model.static answers on demand, and model.for_auth serves the
+			// per-credential view the auth-file page needs.
+			ModelRegistrar: true,
+			ModelProvider:  true,
+			ModelRouter:    true,
+			Executor:       true,
+			// WorkBuddy credentials are auth-bound, so both scopes apply.
+			ExecutorModelScope: string(pluginapi.ExecutorModelScopeBoth),
+			// WorkBuddy speaks OpenAI chat-completions natively in both
+			// directions; no translation layer is needed.
+			ExecutorInputFormats:  []string{"chat-completions"},
+			ExecutorOutputFormats: []string{"chat-completions"},
+		},
+	}
+}
+
+// upstreamError classifies an upstream failure into the same buckets the app
+// used (Y1.j: auth / rate / quota / transient) so the credential pool applies
+// the matching cooldown.
+type upstreamError struct {
+	Kind       failureKind
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+// rateLimitPhrases are substrings the upstream uses when it throttles.
+//
+// The upstream answers a throttle with HTTP 502 and
+// {"type":"server_error","code":"internal_server_error"}, so neither the status
+// code nor the OpenAI error vocabulary identifies it. The only usable signal is
+// the message text, which is Chinese:
+//
+//	您的使用量已超出频率限制，将在 2026-09-27 20:03:46 UTC+8 重置，您也可以切换其他模型继续使用。
+//
+// Without these the throttle fell through to failureTransient: three in a row
+// parked the whole account for errorCooldownMillis, and the account was dropped
+// even for models that were working — while the upstream's own message invites
+// switching models.
+var rateLimitPhrases = []string{
+	"频率限制",
+	"请求过于频繁",
+	"请求频率",
+	"操作过于频繁",
+	"rate limit",
+	"rate_limit",
+	"too many requests",
+	"throttl",
+}
+
+// quotaPhrases mark an exhausted balance rather than a throttle. Kept separate
+// because the two mean opposite things for the remaining credits: a throttle says
+// nothing about the balance, exhaustion zeroes it.
+var quotaPhrases = []string{
+	// Chinese wording used by the provider's own clients.
+	"余额不足",
+	"额度不足",
+	"配额不足",
+	"积分不足",
+	"积分用完",
+	"额度用尽",
+	"没有积分",
+	// English equivalents.
+	"quota exceeded",
+	"quota exhaust",
+	"insufficient quota",
+	"insufficient_quota",
+	"out of credits",
+	"insufficient credit",
+	"no credit",
+	"credit exhausted",
+	"credit not enough",
+	"not enough credit",
+	"payment required",
+}
+
+// containsAnyFold reports whether s contains any phrase, case-insensitively.
+func containsAnyFold(s string, phrases []string) bool {
+	lowered := strings.ToLower(s)
+	for _, phrase := range phrases {
+		if strings.Contains(lowered, strings.ToLower(phrase)) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyUpstream ports the status handling in V1/o.k():
+//
+//	c.p() >= 400 -> V1.o.l(400, "upstream_rejected", body) and V1.k.c(...)
+//
+// OpenAI/Anthropic gateways surface the semantic class in the body, so the
+// status code alone is not enough. The upstream here reports a throttle as
+// 502/internal_server_error, so the message text is checked too.
+func classifyUpstream(statusCode int, body []byte) upstreamError {
+	err := upstreamError{StatusCode: statusCode, Kind: failureTransient}
+
+	var doc struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &doc)
+	}
+	err.Message = strings.TrimSpace(doc.Error.Message)
+	err.Code = strings.TrimSpace(doc.Error.Code)
+	if err.Message == "" {
+		// The body may be a bare string rather than {"error":{...}}: the executor
+		// passes the frame text it captured, and an upstream can answer with a
+		// plain message. Without this the phrase check below has nothing to look
+		// at, and a throttle delivered that way was classified as a generic 5xx.
+		err.Message = strings.TrimSpace(string(body))
+	}
+	errType := strings.ToLower(strings.TrimSpace(doc.Error.Type))
+	errCode := strings.ToLower(err.Code)
+
+	switch {
+	case statusCode == http.StatusUnauthorized, statusCode == http.StatusForbidden,
+		errType == "authentication_error", errType == "permission_error",
+		errCode == "invalid_api_key", errCode == "unauthorized":
+		err.Kind = failureAuth
+
+	case statusCode == http.StatusTooManyRequests,
+		errType == "rate_limit_error", errCode == "rate_limit_exceeded":
+		err.Kind = failureRate
+
+	case errType == "insufficient_quota", errCode == "insufficient_quota",
+		errType == "billing_error", errCode == "quota_exceeded":
+		err.Kind = failureQuota
+
+	case statusCode >= 500:
+		// The upstream reports a throttle as 502/internal_server_error, so a 5xx
+		// is not enough to call this transient. Check the text before deciding;
+		// otherwise a throttle is treated as a generic server fault and parks the
+		// whole account instead of just the throttled model.
+		if containsAnyFold(err.Message, rateLimitPhrases) {
+			err.Kind = failureRate
+		} else if containsAnyFold(err.Message, quotaPhrases) {
+			err.Kind = failureQuota
+		} else {
+			err.Kind = failureTransient
+		}
+
+	default:
+		// Non-5xx, unmatched code: the message is the only remaining signal.
+		// "您的使用量已超出频率限制…" arrives this way on some deployments.
+		if containsAnyFold(err.Message, rateLimitPhrases) {
+			err.Kind = failureRate
+		} else if containsAnyFold(err.Message, quotaPhrases) {
+			err.Kind = failureQuota
+		}
+	}
+
+	if err.Message == "" {
+		err.Message = http.StatusText(statusCode)
+	}
+	return err
+}
+
+// statusForKind maps a failure class to the downstream HTTP status, matching
+// the APK's error envelope codes (400 upstream_rejected, 503 no_healthy_account).
+func statusForKind(k failureKind) int {
+	switch k {
+	case failureAuth:
+		return http.StatusUnauthorized
+	case failureRate:
+		return http.StatusTooManyRequests
+	case failureQuota:
+		return http.StatusForbidden
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+// logf forwards a diagnostic line to the CPA host log (pluginabi.MethodHostLog).
+//
+// It used to be an empty function — the comment described forwarding, the body dropped
+// the message — so every diagnostic written through it vanished. That made the debug
+// setting appear to do nothing and left no trace to read when the supplier switch turned
+// out not to be honoured. The host call is fire-and-forget: a host that does not expose
+// the callback should not break a request.
+func logf(format string, args ...any) {
+	if !state.settings.get().Debug {
+		return
+	}
+	message := fmt.Sprintf(format, args...)
+	_, _ = callHost("host.log", map[string]any{
+		"level":   "info",
+		"message": "[workbuddy] " + message,
+	})
+}
+
+// recordingEnabled reports whether the plugin should record a call.
+func recordingEnabled() bool { return true }
+
+// nowUTC returns the current time in UTC.
+//
+// Kept for the few places that need an unambiguous instant. Call timestamps are NOT one
+// of them: the panel buckets them into hours and days and prints those labels, so they
+// have to be wall-clock times in the operator's zone.
+func nowUTC() time.Time { return time.Now().UTC() }
+
+// panelLocation is the time zone the panel displays times in.
+//
+// Beijing time, fixed rather than taken from the environment. The plugin runs inside the
+// CPA process, and that process has no reliable time zone: under the Android sandbox it
+// starts with TZ unset, so the local zone is UTC while the person reading the panel is
+// eight hours ahead. The trend then labelled a 15:30 call as 07:00, and the day boundary
+// fell at 08:00 local. Pinning the zone makes the figures match the clock on the wall
+// regardless of how the host was started.
+//
+// A machine whose clock is set to Asia/Shanghai needs nothing; one that is not still sees
+// correct Beijing times, which is the point.
+var panelLocation = func() *time.Location {
+	if loc, errLoad := time.LoadLocation("Asia/Shanghai"); errLoad == nil {
+		return loc
+	}
+	// No zoneinfo database: a fixed +08:00 offset is exactly equivalent for this zone
+	// (China has observed no daylight saving since 1991).
+	return time.FixedZone("CST", 8*60*60)
+}()
+
+// nowPanel returns the current time in the zone the panel displays.
+func nowPanel() time.Time { return time.Now().In(panelLocation) }
