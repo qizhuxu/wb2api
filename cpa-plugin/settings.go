@@ -1,0 +1,542 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+// gatewaySettings is a faithful port of V1.s (GatewaySettings) from
+// AI 聚合网关 0.1.18.
+//
+// Original Kotlin data class field order / defaults:
+//
+//	port                  = 8790
+//	apiKey                = ""
+//	allowNoKey            = true
+//	exposeLan             = true
+//	onlyUsableModels      = false
+//	refreshSkewSeconds    = 86400
+//	maxRotate             = 3
+//	quotaCooldownMillis   = 43200000   (12h)
+//	softCooldownMillis    = 60000      (60s)
+//	errorThreshold        = 3
+//	errorCooldownMillis   = 600000     (10m)
+//	logRetentionDays      = 30
+//	defaultProvider       = "trae"
+//
+// Field names below use snake_case so that they can be declared directly as
+// plugin ConfigFields in config.yaml.
+type gatewaySettings struct {
+	// Port is the original gateway listen port. CPA owns its own listener, so
+	// this value is reported for parity only.
+	Port int `json:"port" yaml:"port"`
+	// APIKey is the client-facing bearer token (V1/o.j()).
+	APIKey string `json:"api_key" yaml:"api_key"`
+	// AllowNoKey mirrors allowNoKey: when true the Authorization header is not
+	// required at all. Only consulted when EnforceFrontendKey is on.
+	AllowNoKey bool `json:"allow_no_key" yaml:"allow_no_key"`
+	// EnforceFrontendKey makes this plugin check the client bearer token itself.
+	//
+	// Default false: CPA already authenticates /v1/* against its own api-keys
+	// before a provider is reached, so a second mandatory gate here would reject
+	// every one of the operator's existing CPA keys.
+	EnforceFrontendKey bool `json:"enforce_frontend_key" yaml:"enforce_frontend_key"`
+	// ExposeLAN mirrors exposeLan (bind 0.0.0.0 vs 127.0.0.1). Reported only.
+	ExposeLAN bool `json:"expose_lan" yaml:"expose_lan"`
+	// OnlyUsableModels mirrors onlyUsableModels: hide models whose provider
+	// marks them unavailable.
+	OnlyUsableModels bool `json:"only_usable_models" yaml:"only_usable_models"`
+	// RefreshSkewSeconds mirrors refreshSkewSeconds: refresh credentials this
+	// far ahead of expiry.
+	RefreshSkewSeconds int64 `json:"refresh_skew_seconds" yaml:"refresh_skew_seconds"`
+	// MaxRotate mirrors maxRotate: how many credentials to try per request.
+	MaxRotate int `json:"max_rotate" yaml:"max_rotate"`
+	// QuotaCooldownMillis mirrors quotaCooldownMillis: hard cooldown after a
+	// quota/balance rejection.
+	QuotaCooldownMillis int64 `json:"quota_cooldown_millis" yaml:"quota_cooldown_millis"`
+	// SoftCooldownMillis mirrors softCooldownMillis: cooldown applied after a
+	// single transient failure.
+	SoftCooldownMillis int64 `json:"soft_cooldown_millis" yaml:"soft_cooldown_millis"`
+	// RateCooldownMillis is this plugin's addition: cooldown applied after a
+	// 429/throttle. The app folds a rate limit into quotaCooldownMillis, which
+	// parked a merely throttled credential for 12h and zeroed its balance;
+	// a throttle is transient, so it gets its own (shorter) window and leaves
+	// Credits untouched.
+	RateCooldownMillis int64 `json:"rate_cooldown_millis" yaml:"rate_cooldown_millis"`
+	// ErrorThreshold mirrors errorThreshold: consecutive failures required
+	// before a credential is parked.
+	ErrorThreshold int `json:"error_threshold" yaml:"error_threshold"`
+	// ErrorCooldownMillis mirrors errorCooldownMillis: park duration once
+	// ErrorThreshold is reached.
+	ErrorCooldownMillis int64 `json:"error_cooldown_millis" yaml:"error_cooldown_millis"`
+	// LogRetentionDays mirrors logRetentionDays.
+	LogRetentionDays int `json:"log_retention_days" yaml:"log_retention_days"`
+	// DefaultProvider mirrors defaultProvider: used when the requested model
+	// carries no explicit "provider/model" prefix.
+	// DefaultProvider is the provider used when a model name carries no
+	// explicit prefix.
+	//
+	DefaultProvider string `json:"default_provider" yaml:"default_provider"`
+	// DefaultModel is the model used when the client asks for "auto" or omits
+	// the model entirely, mirroring a2/b.java k()'s configured default.
+	DefaultModel string `json:"default_model" yaml:"default_model"`
+	// EnforceDefaultProvider, when true, rejects requests that address a
+	// provider other than DefaultProvider. The original app always honoured an
+	// explicit "provider/model" prefix, so this defaults to false.
+	EnforceDefaultProvider bool `json:"enforce_default_provider" yaml:"enforce_default_provider"`
+	// Debug enables verbose host logging.
+	Debug bool `json:"debug" yaml:"debug"`
+	// Checkin holds the daily check-in configuration (nested under "checkin").
+	Checkin checkinSettings `json:"checkin" yaml:"checkin"`
+	// Quota holds the quota-refresh configuration (nested under "quota").
+	Quota quotaSettings `json:"quota" yaml:"quota"`
+	// Growth holds the scheduled growth-task configuration (nested under "growth").
+	Growth growthSettings `json:"growth" yaml:"growth"`
+	// Routing holds the account-selection strategy (nested under "routing").
+	Routing routingSettings `json:"routing" yaml:"routing"`
+	// VariantOverride scopes which accounts an operation acts on.
+	// "" = auto (every account), "cn" = domestic only, "ai" = international only.
+	// It never changes an account's own realm; see variantAllowed.
+	//
+	// This is the supplier switch for *calls*. Authorisation has its own setting
+	// (AuthSupplier) so the two can be chosen independently.
+	VariantOverride string `json:"variant_override" yaml:"variant_override"`
+	// AuthSupplier picks which supplier CPA's OAuth entry authorises against.
+	// "" = follow VariantOverride (and fall back to domestic), "cn" = domestic,
+	// "ai" = international.
+	//
+	// Separate from VariantOverride on purpose: an operator may want to keep
+	// routing calls to both suppliers while adding an account for just one, and
+	// coupling the two made that impossible without flipping the call scope.
+	AuthSupplier string `json:"auth_supplier" yaml:"auth_supplier"`
+	// ReasoningEnabled is the master switch for thinking injection.
+	//
+	// On by default. The upstream does not think at all unless it receives a
+	// top-level reasoning_effort, and several catalogue models are
+	// onlyReasoning, so "off" silently drops a capability the account already
+	// paid for; injecting is what a caller expects from a reasoning model.
+	//
+	// The switch exists for raw passthrough semantics, and for diagnosing
+	// thinking consuming the token budget (at max_tokens=16 a thinking model
+	// returns an empty body with finish_reason=length).
+	ReasoningEnabled bool `json:"reasoning_enabled" yaml:"reasoning_enabled"`
+	// ReasoningEffort is injected when the client expressed no preference: one
+	// of minimal/low/medium/high/xhigh/max. A typo is normalised back to the
+	// default (see applyDefaults) rather than forwarded, since the upstream
+	// rejects an unknown level with 11150.
+	//
+	// "high" rather than the maximum: "max" makes short requests return an
+	// empty body with finish_reason=length. It is also the defaultEffort the
+	// upstream declares for the models that pin one.
+	ReasoningEffort string `json:"reasoning_effort" yaml:"reasoning_effort"`
+}
+
+// defaultGatewaySettings returns the exact defaults of V1.s's synthetic
+// no-arg constructor, plus this plugin's own additions.
+func defaultGatewaySettings() gatewaySettings {
+	return gatewaySettings{
+		Port:                8790,
+		APIKey:              "",
+		AllowNoKey:          true,
+		ExposeLAN:           true,
+		OnlyUsableModels:    false,
+		RefreshSkewSeconds:  86400,
+		MaxRotate:           3,
+		QuotaCooldownMillis: 43_200_000,
+		SoftCooldownMillis:  60_000,
+		RateCooldownMillis:  300_000,
+		ErrorThreshold:      3,
+		ErrorCooldownMillis: 600_000,
+		LogRetentionDays:    30,
+		// DefaultProvider is the provider used when a model name carries no
+		// explicit prefix. It defaults to this plugin's own key rather than the
+		// value the source app shipped ("trae"): the source app was a general
+		// gateway hosting several providers, while this plugin only serves
+		// WorkBuddy. Leaving "trae" here meant that turning on
+		// enforce_default_provider rejected every codebuddy/... request with
+		// "该网关仅允许使用默认供应商：trae" — the plugin refusing its own models.
+		DefaultProvider:        workBuddyProviderKey,
+		EnforceDefaultProvider: false,
+		Checkin:                defaultCheckinSettings(),
+		Growth:                 defaultGrowthSettings(),
+		Quota:                  defaultQuotaSettings(),
+		Routing:                defaultRoutingSettings(),
+		VariantOverride:        "",
+		// Thinking injection is on by default; see the field comments.
+		ReasoningEnabled: true,
+		ReasoningEffort:  defaultReasoningEffort,
+	}
+}
+
+// applyDefaults fills zero values with V1.s defaults, then normalises.
+// It mirrors the guards used by V1.z.b() (port range, non-blank host).
+func (g *gatewaySettings) applyDefaults() {
+	d := defaultGatewaySettings()
+	if g.Port <= 0 || g.Port >= 65536 {
+		g.Port = d.Port
+	}
+	if g.RefreshSkewSeconds <= 0 {
+		g.RefreshSkewSeconds = d.RefreshSkewSeconds
+	}
+	if g.MaxRotate < 1 {
+		g.MaxRotate = d.MaxRotate
+	}
+	if g.QuotaCooldownMillis <= 0 {
+		g.QuotaCooldownMillis = d.QuotaCooldownMillis
+	}
+	if g.SoftCooldownMillis <= 0 {
+		g.SoftCooldownMillis = d.SoftCooldownMillis
+	}
+	if g.RateCooldownMillis <= 0 {
+		g.RateCooldownMillis = d.RateCooldownMillis
+	}
+	if g.ErrorThreshold < 1 {
+		g.ErrorThreshold = d.ErrorThreshold
+	}
+	if g.ErrorCooldownMillis <= 0 {
+		g.ErrorCooldownMillis = d.ErrorCooldownMillis
+	}
+	if g.LogRetentionDays < 1 {
+		g.LogRetentionDays = d.LogRetentionDays
+	}
+	g.DefaultProvider = strings.ToLower(strings.TrimSpace(g.DefaultProvider))
+	if g.DefaultProvider == "" {
+		g.DefaultProvider = d.DefaultProvider
+	}
+	g.APIKey = strings.TrimSpace(g.APIKey)
+
+	// The check-in block is nested, so YAML decoding replaces it wholesale with
+	// the zero value when the section is absent. Restore the defaults in that
+	// case so an empty config does not silently schedule 00:00.
+	g.Checkin.applyDefaults()
+	// Same reasoning for the quota block.
+	g.Quota.applyDefaults()
+	// And the routing block.
+	g.Routing.applyDefaults()
+	// Normalize variant override.
+	if g.VariantOverride != "" && g.VariantOverride != "cn" && g.VariantOverride != "ai" {
+		g.VariantOverride = ""
+	}
+	// And the authorisation supplier.
+	if g.AuthSupplier != "" && g.AuthSupplier != "cn" && g.AuthSupplier != "ai" {
+		g.AuthSupplier = ""
+	}
+	// Thinking injection. ReasoningEnabled is left alone: decodeLifecycleConfig
+	// seeds from defaultGatewaySettings, so an absent key already arrives true
+	// and a false here is an explicit opt-out. The level is validated because it
+	// reaches an upstream request, and an unusable value must mean "inject
+	// nothing" rather than a request the upstream rejects with 11150.
+	g.ReasoningEffort = normaliseReasoningEffort(g.ReasoningEffort)
+	if !isValidReasoningEffort(g.ReasoningEffort) {
+		g.ReasoningEffort = defaultReasoningEffort
+	}
+}
+
+// authSupplierOrDefault resolves which supplier authorisation should use.
+//
+// Empty means "not chosen explicitly": it follows the call-scope setting so an
+// operator who picked 国际供应商 there gets an international login link without
+// touching a second control; if that is also unset (全部供应商) it falls back to
+// domestic, which is the majority case.
+func (g gatewaySettings) authSupplierOrDefault() wbVariant {
+	if variant, ok := parseVariant(g.AuthSupplier); ok {
+		return variant
+	}
+	if variant, ok := parseVariant(g.VariantOverride); ok {
+		return variant
+	}
+	return variantCn
+}
+
+// applyDefaults fills the check-in block with sensible values when it was not
+// configured. Everything except Enabled/OnStart is range-checked rather than
+// defaulted, so an explicit 0 is still honoured for Minute.
+func (c *checkinSettings) applyDefaults() {
+	d := defaultCheckinSettings()
+	if c.Hour < 0 || c.Hour > 23 {
+		c.Hour = d.Hour
+	}
+	if c.Minute < 0 || c.Minute > 59 {
+		c.Minute = d.Minute
+	}
+	// A completely unset block (all zero) is indistinguishable from "midnight"
+	// in YAML, so treat "disabled + 00:00" as "not configured" and restore the
+	// documented 09:00 default.
+	if !c.Enabled && c.Hour == 0 && c.Minute == 0 {
+		c.Hour = d.Hour
+		c.Minute = d.Minute
+	}
+}
+
+// settingsStore holds the live settings. The host re-sends the plugin config on
+// plugin.register and plugin.reconfigure, so this is swapped atomically.
+type settingsStore struct {
+	mu  sync.RWMutex
+	val gatewaySettings
+
+	// persistPath is the on-disk mirror for panel-only overrides (variant
+	// override). CPA re-sends config_yaml on register/reconfigure, and the YAML
+	// does not carry variant_override back, so without this file the panel
+	// choice would silently reset to "auto" on every hot-reload. Empty
+	// disables persistence (used by tests that must stay hermetic).
+	persistPath string
+
+	// registrations counts plugin.register / plugin.reconfigure calls so the
+	// management page can show that hot-reload is wired up.
+	registrations atomic.Int64
+}
+
+// newSettingsStore returns a store backed by the default per-user state file.
+func newSettingsStore() *settingsStore {
+	return newSettingsStoreWithPersist(filepath.Join(pluginStateDir(), "state.json"))
+}
+
+// newSettingsStoreWithPersist returns a store writing overrides to path.
+// Pass "" to disable persistence entirely (hermetic tests).
+func newSettingsStoreWithPersist(path string) *settingsStore {
+	s := &settingsStore{persistPath: path}
+	s.val = defaultGatewaySettings()
+	return s
+}
+
+func (s *settingsStore) get() gatewaySettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.val
+}
+
+func (s *settingsStore) set(v gatewaySettings) {
+	v.applyDefaults()
+	s.mu.Lock()
+	s.val = v
+	s.mu.Unlock()
+}
+
+// setCheckin replaces only the check-in block, leaving gateway settings intact.
+func (s *settingsStore) setCheckin(cfg checkinSettings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.val.Checkin = cfg
+}
+
+// setGrowth replaces only the growth-schedule block, leaving gateway settings intact.
+func (s *settingsStore) setGrowth(cfg growthSettings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.val.Growth = cfg
+}
+
+// setQuota replaces only the quota block, leaving gateway settings intact.
+func (s *settingsStore) setQuota(cfg quotaSettings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.val.Quota = cfg
+}
+
+// setVariantOverride persists the call-scope setting. The override is stored
+// both in memory and in the per-user state file so that a later
+// plugin.reconfigure (which carries no variant_override in its YAML) cannot
+// silently reset the panel choice back to "auto".
+func (s *settingsStore) setVariantOverride(v string) {
+	s.mu.Lock()
+	if v != "" && v != "cn" && v != "ai" {
+		v = ""
+	}
+	s.val.VariantOverride = v
+	authSupplier := s.val.AuthSupplier
+	s.mu.Unlock()
+	s.savePanelChoicesLocked(v, authSupplier)
+	// Mirror the switch onto the host's own credential list.
+	//
+	// The plugin's pick already honours the setting, but that is not enough to keep a
+	// request off the other realm: CPA keeps its own candidate list, and when the plugin's
+	// pick fails or returns nothing the host selects from that list itself — a retry after
+	// a failure, for instance, which is exactly the path that made 仅国际 still reach a
+	// domestic account.
+	//
+	// Disabling the other realm's credentials in the host is the only lever this plugin
+	// has over that path, since the host's scheduler reads the same flag when building its
+	// candidates. It is a real state change rather than a per-request hint, so it is done
+	// only for an explicit cn/ai choice, and the credentials' previous flag is restored the
+	// moment the switch goes back to 自动.
+	syncVariantScopeToHost(v)
+}
+
+// setAuthSupplier persists which supplier authorisation should use.
+//
+// Kept in the same file as the call scope: two independent writers to one path
+// would overwrite each other's key, and a panel click on one control would
+// silently drop the other's value.
+func (s *settingsStore) setAuthSupplier(v string) {
+	s.mu.Lock()
+	if v != "" && v != "cn" && v != "ai" {
+		v = ""
+	}
+	s.val.AuthSupplier = v
+	variantOverride := s.val.VariantOverride
+	s.mu.Unlock()
+	s.savePanelChoicesLocked(variantOverride, v)
+}
+
+// panelChoices is the on-disk shape for the two panel selections.
+type panelChoices struct {
+	VariantOverride string `json:"variant_override"`
+	AuthSupplier    string `json:"auth_supplier"`
+}
+
+// savePanelChoicesLocked mirrors both panel selections to disk (best effort;
+// a read-only data dir must not break the panel).
+func (s *settingsStore) savePanelChoicesLocked(variantOverride, authSupplier string) {
+	if s.persistPath == "" {
+		return
+	}
+	raw, errMarshal := json.Marshal(panelChoices{
+		VariantOverride: variantOverride,
+		AuthSupplier:    authSupplier,
+	})
+	if errMarshal != nil {
+		return
+	}
+	_ = atomicWriteFile(s.persistPath, raw)
+}
+
+// restorePanelChoices reads previously persisted panel selections.
+func (s *settingsStore) restorePanelChoices() panelChoices {
+	if s.persistPath == "" {
+		return panelChoices{}
+	}
+	raw, errRead := os.ReadFile(s.persistPath)
+	if errRead != nil {
+		return panelChoices{}
+	}
+	var disk panelChoices
+	if errUnmarshal := json.Unmarshal(raw, &disk); errUnmarshal != nil {
+		return panelChoices{}
+	}
+	return disk
+}
+
+// validVariantChoice reports whether a stored value is usable.
+func validVariantChoice(v string) bool {
+	return v == "" || v == "cn" || v == "ai"
+}
+
+// saveVariantOverrideLocked is kept for callers that only touch the call scope.
+func (s *settingsStore) saveVariantOverrideLocked(v string) {
+	s.mu.Lock()
+	authSupplier := s.val.AuthSupplier
+	s.mu.Unlock()
+	s.savePanelChoicesLocked(v, authSupplier)
+}
+
+// restoreVariantOverride reads a previously persisted override (from a panel
+// action in an earlier plugin instance or before the last reconfigure).
+func (s *settingsStore) restoreVariantOverride() string {
+	disk := s.restorePanelChoices()
+	if !validVariantChoice(disk.VariantOverride) {
+		return ""
+	}
+	return disk.VariantOverride
+}
+
+// setRouting replaces only the routing block, leaving gateway settings intact.
+func (s *settingsStore) setRouting(cfg routingSettings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.val.Routing = cfg
+}
+
+// lifecycleRequest is the payload CPA sends for plugin.register /
+// plugin.reconfigure / plugin.quiesce.
+//
+//	rpcLifecycleRequest{
+//	    ConfigYAML    []byte `json:"config_yaml"`
+//	    SchemaVersion uint32 `json:"schema_version"`
+//	}
+//
+// The ConfigYAML holds the raw YAML node the user wrote under
+// plugins.configs.<plugin-id>, i.e. exactly the ConfigFields declared in the
+// registration metadata.
+type lifecycleRequest struct {
+	ConfigYAML    []byte `json:"config_yaml"`
+	SchemaVersion uint32 `json:"schema_version"`
+}
+
+// decodeLifecycleConfig parses the plugin config YAML node into settings.
+//
+// The incoming YAML is the flattened config namespace, e.g.
+//
+//	enabled: true
+//	priority: 1
+//	port: 8790
+//	api_key: "sk-..."
+//
+// "enabled" and "priority" are host-owned and ignored here.
+func (s *settingsStore) decodeLifecycleConfig(raw []byte) error {
+	// Start from the defaults, not from a zero struct: the host's YAML does not carry
+	// every panel field, and decoding into an empty struct turns each missing section
+	// into its zero value. That is how the growth schedule came up as "hour 0,
+	// on_start false" — the defaults were computed and then overwritten by zeros for
+	// every key the YAML did not mention.
+	cfg := defaultGatewaySettings()
+	if len(raw) > 0 {
+		if errUnmarshal := yamlUnmarshalFlattened(raw, &cfg); errUnmarshal != nil {
+			return errUnmarshal
+		}
+		// Fields the host never writes must keep their defaults when absent. The
+		// decoder cannot tell "absent" from "explicitly zero" for value types, so the
+		// sections that are panel-only are restored wholesale when their key is
+		// missing from the YAML.
+		if !yamlHasKey(raw, "checkin") {
+			cfg.Checkin = defaultCheckinSettings()
+		}
+		if !yamlHasKey(raw, "quota") {
+			cfg.Quota = defaultQuotaSettings()
+		}
+		if !yamlHasKey(raw, "growth") {
+			cfg.Growth = defaultGrowthSettings()
+		}
+		if !yamlHasKey(raw, "routing") {
+			cfg.Routing = defaultRoutingSettings()
+		}
+	}
+	s.set(cfg)
+	// The host YAML does not round-trip panel-only fields. If the config does
+	// not explicitly set variant_override, restore the persisted panel choice
+	// so a reconfigure does not flip a manually forced variant back to "auto".
+	if !yamlHasKey(raw, "variant_override") {
+		// Restore both panel selections from the state file. They are read
+		// together because a reconfigure carries neither, and restoring only
+		// one would silently reset the other to its default.
+		disk := s.restorePanelChoices()
+		s.mu.Lock()
+		if validVariantChoice(disk.VariantOverride) {
+			s.val.VariantOverride = disk.VariantOverride
+		}
+		if validVariantChoice(disk.AuthSupplier) {
+			s.val.AuthSupplier = disk.AuthSupplier
+		}
+		s.mu.Unlock()
+	}
+	s.registrations.Add(1)
+	return nil
+}
+
+// marshalForLog renders the settings for the management endpoint, redacting the
+// API key the same way V1.s.toString() does.
+func (g gatewaySettings) marshalForLog() map[string]any {
+	out := map[string]any{}
+	raw, errMarshal := json.Marshal(g)
+	if errMarshal != nil {
+		return out
+	}
+	_ = json.Unmarshal(raw, &out)
+	if g.APIKey != "" {
+		out["api_key"] = "[REDACTED]"
+	}
+	return out
+}

@@ -1,0 +1,721 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// This file adds the check-in feature on top of the ported WorkBuddy client:
+//
+//	* manual run   : check in every WorkBuddy account now
+//	* automatic run: a daily schedule, driven by config
+//
+// Results are kept in memory (bounded) and surfaced on the management page.
+
+// checkinSettings is the check-in half of the plugin configuration.
+type checkinSettings struct {
+	// Enabled turns the automatic daily run on or off.
+	Enabled bool `json:"enabled" yaml:"enabled"`
+	// Hour/Minute is the local time of day for the automatic run.
+	Hour   int `json:"hour" yaml:"hour"`
+	Minute int `json:"minute" yaml:"minute"`
+	// OnStart also runs a catch-up pass when the plugin loads and today's run
+	// has not happened yet.
+	OnStart bool `json:"on_start" yaml:"on_start"`
+	// RetryOnDeviceFingerprint mirrors the source app's behaviour of sleeping
+	// 8s and retrying once when the upstream rejects the device fingerprint
+	// (d2/C0482C.java catches code 9074 and retries).
+	RetryOnDeviceFingerprint bool `json:"retry_on_device_fingerprint" yaml:"retry_on_device_fingerprint"`
+}
+
+// defaultCheckinSettings: the automatic run is off by default so the plugin
+// never calls out on the operator's behalf unless asked.
+func defaultCheckinSettings() checkinSettings {
+	return checkinSettings{
+		Enabled: false,
+		// 08:00 — an hour before the growth pass, so the sign-in reward is banked before
+		// the tasks that may depend on it run.
+		Hour:   8,
+		Minute: 0,
+		// Catch-up on load is off by default. It runs a network pass the operator never
+		// asked for at the moment the plugin loads, which on a fresh install is the first
+		// thing that happens — before they have seen the setting that enables it.
+		OnStart:                  false,
+		RetryOnDeviceFingerprint: true,
+	}
+}
+
+// checkinResult is one account's outcome, as shown on the management page.
+type checkinResult struct {
+	AuthID  string `json:"auth_id"`
+	Label   string `json:"label"`
+	UID     string `json:"uid"`
+	Domain  string `json:"domain"`
+	Success bool   `json:"success"`
+	// Skipped marks an account the pass deliberately did not check in, such as
+	// an international credential with no check-in endpoint. It is distinct from
+	// a failure so the UI does not paint it red.
+	Skipped   bool      `json:"skipped,omitempty"`
+	Message   string    `json:"message"`
+	Already   bool      `json:"already_checked_in"`
+	Code      int       `json:"code"`
+	Status    int       `json:"http_status,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
+	Error     string    `json:"error,omitempty"`
+}
+
+// checkinRun is one pass over all accounts.
+type checkinRun struct {
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+	Trigger    string    `json:"trigger"` // "manual" | "auto" | "startup"
+	Total      int       `json:"total"`
+	Succeeded  int       `json:"succeeded"`
+	Failed     int       `json:"failed"`
+	// Skipped counts accounts the pass intentionally did not attempt, so that
+	// Total == Succeeded + Failed + Skipped always holds.
+	Skipped int             `json:"skipped,omitempty"`
+	Results []checkinResult `json:"results"`
+	// Note explains a pass that had nothing to do, when the reason is not obvious.
+	//
+	// A pool of international accounts yields Total 0 every time, and the panel showed
+	// that as a completed run with no results — indistinguishable from a pass that ran and
+	// found everything already done. The note names the actual cause.
+	Note string `json:"note,omitempty"`
+}
+
+// checkinState holds the scheduler + history.
+type checkinState struct {
+	mu sync.Mutex
+	// history is newest-first, bounded by historyMax.
+	history []checkinRun
+	// lastAutoDay records the date of the last successful automatic run so the
+	// daily trigger fires at most once per day.
+	lastAutoDay string
+	// running guards against overlapping runs.
+	running bool
+	// stopCh ends the background loop on shutdown.
+	stopCh chan struct{}
+	// started reports whether the loop is active (so we never start twice).
+	started bool
+}
+
+const checkinHistoryMax = 20
+
+func newCheckinState() *checkinState {
+	return &checkinState{stopCh: make(chan struct{}, 1)}
+}
+
+// ---- account enumeration -------------------------------------------------
+
+// checkinAccount is one credential eligible for check-in.
+type checkinAccount struct {
+	AuthID string
+	Label  string
+	Creds  *workBuddyCredentials
+}
+
+// collectCheckinAccounts reads every WorkBuddy credential CPA knows about.
+//
+// The host exposes the auth-file inventory through host.auth.list; each entry's
+// storage is read with host.auth.get. Credentials we cannot parse are skipped
+// rather than failing the whole run.
+// selectActionableAccounts filters an inventory down to the accounts a batch
+// operation may touch.
+//
+// The version selector scopes the work:
+//
+//	auto  -> every enabled account, so a pool holding both 国内版 and 国际版
+//	         credentials is fully served in one pass;
+//	国内版 -> only cn credentials;
+//	国际版 -> only ai credentials.
+//
+// It never re-labels an account; each one still routes to the host that issued
+// its token.
+func selectActionableAccounts(accounts []checkinAccount) []checkinAccount {
+	out := make([]checkinAccount, 0, len(accounts))
+	for _, account := range accounts {
+		if !variantAllowed(account.Creds) {
+			continue
+		}
+		out = append(out, account)
+	}
+	return out
+}
+
+// collectActionableAccounts is the batch-operation entry point.
+func collectActionableAccounts() ([]checkinAccount, error) {
+	accounts, errCollect := collectCheckinAccounts()
+	if errCollect != nil {
+		return nil, errCollect
+	}
+	return selectActionableAccounts(accounts), nil
+}
+
+// splitAccountsByVariant groups an inventory for display.
+//
+// The panel shows both groups with their own counts, because a mixed pool is
+// now the normal case and the two halves behave differently (an international
+// account has no check-in, for instance).
+func splitAccountsByVariant(accounts []workBuddyAccount) (cn, ai []workBuddyAccount) {
+	for _, account := range accounts {
+		if account.Variant == string(variantAi) {
+			ai = append(ai, account)
+		} else {
+			cn = append(cn, account)
+		}
+	}
+	return cn, ai
+}
+
+// collectCheckinAccounts enumerates every credential this plugin owns.
+//
+// This is the single inventory used by the panel, the check-in pass, the quota
+// refresh and the task engine, so it deliberately does NOT apply the version
+// selector: the account list must show a mixed pool in full. Callers that act
+// on accounts filter through selectActionableAccounts, which honours the
+// selector without changing how any account is routed.
+//
+// Inclusion rule (isWorkBuddyAuthEntry) is the same one the panel uses. An
+// earlier version tested only provider/type, which disagreed with the panel
+// whenever a host exposed a credential solely through its file name — the
+// account showed up in the list but was missing from quota totals and check-in.
+func collectCheckinAccounts() ([]checkinAccount, error) {
+	return collectAccounts(false)
+}
+
+// collectAllAccounts is collectCheckinAccounts without the check-in-only rule that
+// drops international accounts. The credit query exists for both realms, so the
+// quota refresh must see them: excluding them left every international row at
+// 「余额未知」 because no request was ever made for it.
+func collectAllAccounts() ([]checkinAccount, error) {
+	return collectAccounts(true)
+}
+
+func collectAccounts(includeInternational bool) ([]checkinAccount, error) {
+	raw, errList := callHost("host.auth.list", map[string]any{})
+	if errList != nil {
+		return nil, errList
+	}
+
+	// Use the shared decoder: CPA nests the entries under "files".
+	entries := decodeAuthEntries(raw)
+
+	var out []checkinAccount
+	for _, entry := range entries {
+		if !isWorkBuddyAuthEntry(entry) {
+			continue
+		}
+		storage := entry.StorageJSON
+		if len(storage) == 0 && entry.AuthIndex != "" {
+			// Fall back to reading the file contents.
+			if fetched := fetchAuthStorage(entry.AuthIndex); len(fetched) > 0 {
+				storage = fetched
+			}
+		}
+		creds, errParse := parseWorkBuddyCredentials(storage)
+		if errParse != nil {
+			continue
+		}
+		id := entry.AuthIndex
+		if id == "" {
+			id = creds.authID()
+		}
+		// Skip accounts the operator disabled from the panel, or the host has
+		// parked. The task engine and the scheduled passes share this list, so
+		// filtering here keeps every caller consistent.
+		if state.pool.isAccountDisabled(creds.UID, id) {
+			continue
+		}
+		// An international account has no check-in. The upstream endpoint for it does not
+		// exist, so including one produced a run that always failed — the operator saw a
+		// failure they could do nothing about, and the account's error count crept up for
+		// a request that was never going to succeed.
+		//
+		// Only a domain that positively names the international realm is excluded. An
+		// absent domain is not evidence either way, and variableByDomain treats empty as
+		// international — which would drop every credential whose file omits the field.
+		if !includeInternational && variantOfDomain(creds.Domain) == string(variantAi) && domainSaysInternational(creds.Domain) {
+			continue
+		}
+		out = append(out, checkinAccount{
+			AuthID: id,
+			Label:  firstNonEmpty(entry.Label, entry.Name, creds.label()),
+			Creds:  creds,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].AuthID < out[j].AuthID })
+	return out, nil
+}
+
+// fetchAuthStorage asks the host for one credential's stored JSON.
+//
+// The response nests the body under "json" (rpcHostAuthGetResponse); reading a
+// wrong key here leaves StorageJSON nil and the credential looks unparsable.
+func fetchAuthStorage(authIndex string) json.RawMessage {
+	raw, errGet := callHost("host.auth.get", map[string]any{"auth_index": authIndex})
+	if errGet != nil || len(raw) == 0 {
+		return nil
+	}
+	var resp hostAuthGetResponse
+	if errUnmarshal := json.Unmarshal(raw, &resp); errUnmarshal != nil {
+		return nil
+	}
+	return resp.credentialJSON()
+}
+
+// ---- running -------------------------------------------------------------
+
+// runCheckin performs one pass over every account. trigger is "manual",
+// "auto" or "startup" and only affects reporting.
+func runCheckin(trigger string) *checkinRun {
+	state.checkin.mu.Lock()
+	if state.checkin.running {
+		state.checkin.mu.Unlock()
+		return &checkinRun{
+			Trigger: trigger,
+			Results: []checkinResult{{Error: "已有签到任务正在运行"}},
+		}
+	}
+	state.checkin.running = true
+	state.checkin.mu.Unlock()
+
+	defer func() {
+		state.checkin.mu.Lock()
+		state.checkin.running = false
+		state.checkin.mu.Unlock()
+	}()
+
+	run := &checkinRun{StartedAt: nowPanel(), Trigger: trigger}
+
+	// Check-in exists only for the domestic realm. Enumerate everything so
+	// international credentials can be reported as an explicit skip, but only
+	// act on the accounts the version selector allows — otherwise the totals
+	// would silently omit half a mixed pool.
+	allAccounts, errCollect := collectCheckinAccounts()
+	if errCollect != nil {
+		run.FinishedAt = nowPanel()
+		run.Results = []checkinResult{{Error: "读取账号失败: " + errCollect.Error()}}
+		run.Total = 1
+		run.Failed = 1
+		state.checkin.record(run)
+		return run
+	}
+	accounts := selectActionableAccounts(allAccounts)
+	if errCollect != nil {
+		run.FinishedAt = nowPanel()
+		run.Results = []checkinResult{{Error: "读取账号失败：" + errCollect.Error()}}
+		state.checkin.record(run)
+		return run
+	}
+	if len(accounts) == 0 {
+		run.FinishedAt = nowPanel()
+		// Say which of the three reasons applies, rather than reporting a completed run
+		// with nothing in it. Selecting 国际 and pressing 签到 used to answer "签到完成"
+		// with zero accounts, which reads as success — the operator had no way to tell
+		// that the action does not exist on that side.
+		switch {
+		case len(allAccounts) == 0:
+			run.Note = "没有可签到的账号：尚未添加任何 WorkBuddy 凭证"
+		case allAccountsInternational(allAccounts):
+			run.Note = "国际版没有签到功能：当前只有国际版账号，此操作仅适用于国内版"
+		default:
+			run.Note = "没有可签到的账号：现有账号都不适用于签到"
+		}
+		run.Results = []checkinResult{{Error: run.Note}}
+		state.checkin.record(run)
+		return run
+	}
+
+	settings := state.settings.get()
+	for _, account := range accounts {
+		run.Total++
+		res := checkinOne(account, settings.Checkin)
+		switch {
+		case res.Success:
+			run.Succeeded++
+		case res.Skipped:
+			// Deliberately not attempted (e.g. an international credential with
+			// no check-in endpoint); counting it as a failure would report a
+			// red run for a correct decision.
+			run.Skipped++
+		default:
+			run.Failed++
+		}
+		run.Results = append(run.Results, res)
+	}
+
+	run.FinishedAt = nowPanel()
+	state.checkin.record(run)
+	return run
+}
+
+// checkinOne performs a single account's check-in, including the source app's
+// one-shot retry when the device fingerprint is rejected.
+func checkinOne(account checkinAccount, cfg checkinSettings) checkinResult {
+	variant := variantForCredentials(account.Creds)
+	res := checkinResult{
+		AuthID:    account.AuthID,
+		Label:     account.Label,
+		UID:       account.Creds.UID,
+		Domain:    account.Creds.Domain,
+		CheckedAt: time.Now(),
+	}
+
+	// The international build has no check-in endpoint (see
+	// wbVariant.hasCheckin), so sending one would only ever 404 and get
+	// reported as a failure for every international account. Report it as a
+	// skipped result instead of a fault.
+	if !variant.hasCheckin() {
+		res.Skipped = true
+		res.Message = "国际版无签到功能"
+		return res
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	outcome, errCheckin := workBuddyUpstream.checkin(ctx, account.Creds)
+	if errCheckin != nil {
+		res.Error = errCheckin.Error()
+		res.Message = "签到失败"
+		return res
+	}
+
+	// Retry once on a device-fingerprint rejection, as d2/C0482C.java does.
+	if cfg.RetryOnDeviceFingerprint && !outcome.Success && outcome.Code == checkinCodeDeviceFingerprint {
+		select {
+		case <-time.After(checkinDeviceFingerprintRetryDelay):
+		case <-ctx.Done():
+			res.Error = ctx.Err().Error()
+			return res
+		}
+		if retry, errRetry := workBuddyUpstream.checkin(ctx, account.Creds); errRetry == nil {
+			outcome = retry
+		}
+	}
+
+	res.Success = outcome.Success
+	res.Message = outcome.Message
+	res.Already = outcome.AlreadyCheckedIn
+	res.Code = outcome.Code
+	res.Status = outcome.HTTPStatus
+	return res
+}
+
+const (
+	// checkinCodeDeviceFingerprint is the upstream code the source app retries
+	// on (d2/C0482C.java compares against 9074).
+	checkinCodeDeviceFingerprint = 9074
+	// checkinDeviceFingerprintRetryDelay mirrors the source's Thread.sleep(8000).
+	checkinDeviceFingerprintRetryDelay = 8 * time.Second
+)
+
+// ---- history -------------------------------------------------------------
+
+func (s *checkinState) record(run *checkinRun) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.history = append([]checkinRun{*run}, s.history...)
+	if len(s.history) > checkinHistoryMax {
+		s.history = s.history[:checkinHistoryMax]
+	}
+	if run.Trigger == "auto" && run.FinishedAt.After(run.StartedAt) {
+		s.lastAutoDay = run.StartedAt.In(panelLocation).Format("2006-01-02")
+	}
+}
+
+func (s *checkinState) snapshot(limit int) []checkinRun {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 || limit > len(s.history) {
+		limit = len(s.history)
+	}
+	out := make([]checkinRun, limit)
+	copy(out, s.history[:limit])
+	return out
+}
+
+func (s *checkinState) isRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running
+}
+
+func (s *checkinState) lastAutoDate() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastAutoDay
+}
+
+// ---- scheduler -----------------------------------------------------------
+
+// startCheckinScheduler launches the background loop exactly once.
+func startCheckinScheduler() {
+	state.checkin.mu.Lock()
+	if state.checkin.started {
+		state.checkin.mu.Unlock()
+		return
+	}
+	state.checkin.started = true
+	state.checkin.mu.Unlock()
+
+	safeGo("checkin-loop", checkinLoop)
+}
+
+// checkinLoop wakes up periodically and runs the daily check-in when due.
+//
+// A short tick interval keeps the trigger responsive without needing cron;
+// lastAutoDay makes the run at-most-once per calendar day.
+func checkinLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	// Catch-up run at startup when configured.
+	//
+	// Guarded like the scheduled ticks: an unguarded panic here would end the
+	// goroutine before the select loop starts, so the scheduler would never run
+	// again and nothing would report why.
+	settings := state.settings.get()
+	if settings.Checkin.Enabled && settings.Checkin.OnStart && !checkinRanToday(settings.Checkin) {
+		guardLoop("checkin-startup", func() {
+			runCheckin("startup")
+		})
+	}
+
+	for {
+		select {
+		case <-state.checkin.stopCh:
+			return
+		case <-ticker.C:
+			cfg := state.settings.get().Checkin
+			if !cfg.Enabled {
+				continue
+			}
+			if checkinRanToday(cfg) {
+				continue
+			}
+			if !checkinDueNow(cfg) {
+				continue
+			}
+			guardLoop("checkin-tick", func() {
+				runCheckin("auto")
+			})
+		}
+	}
+}
+
+// checkinRanToday reports whether the automatic run already happened today.
+func checkinRanToday(_ checkinSettings) bool {
+	return state.checkin.lastAutoDate() == time.Now().Format("2006-01-02")
+}
+
+// checkinDueNow reports whether the configured time of day has been reached.
+func checkinDueNow(cfg checkinSettings) bool {
+	now := time.Now()
+	target := time.Date(now.Year(), now.Month(), now.Day(), clampHour(cfg.Hour), clampMinute(cfg.Minute), 0, 0, now.Location())
+	return !now.Before(target)
+}
+
+func clampHour(h int) int {
+	if h < 0 {
+		return 0
+	}
+	if h > 23 {
+		return 23
+	}
+	return h
+}
+
+func clampMinute(m int) int {
+	if m < 0 {
+		return 0
+	}
+	if m > 59 {
+		return 59
+	}
+	return m
+}
+
+// stopCheckinScheduler ends the background loop.
+func stopCheckinScheduler() {
+	state.checkin.mu.Lock()
+	started := state.checkin.started
+	state.checkin.started = false
+	state.checkin.mu.Unlock()
+	if !started {
+		return
+	}
+	// Buffered send: see stopQuotaScheduler. An unbuffered channel would drop
+	// the signal whenever the loop happened to be mid-check-in, leaving a
+	// running loop behind a "started = false" flag.
+	select {
+	case state.checkin.stopCh <- struct{}{}:
+	default:
+	}
+}
+
+// ---- management helpers --------------------------------------------------
+
+// runFromManagement is the entry point used by the management HTTP handler.
+func runFromManagement() *checkinRun {
+	return runCheckin("manual")
+}
+
+// applyCheckinConfig validates and stores the check-in settings.
+func applyCheckinConfig(cfg checkinSettings) checkinSettings {
+	cfg.Hour = clampHour(cfg.Hour)
+	cfg.Minute = clampMinute(cfg.Minute)
+	state.settings.setCheckin(cfg)
+	return cfg
+}
+
+// checkinStatusJSON is the payload for the status/summary endpoint.
+func checkinStatusJSON() map[string]any {
+	cfg := state.settings.get().Checkin
+	return map[string]any{
+		"enabled":                     cfg.Enabled,
+		"hour":                        cfg.Hour,
+		"minute":                      cfg.Minute,
+		"on_start":                    cfg.OnStart,
+		"retry_on_device_fingerprint": cfg.RetryOnDeviceFingerprint,
+		"running":                     state.checkin.isRunning(),
+		"last_auto_day":               state.checkin.lastAutoDate(),
+		"next_run":                    nextCheckinTime(cfg),
+		"history":                     state.checkin.snapshot(10),
+	}
+}
+
+// nextCheckinTime renders the next scheduled run, or "" when disabled.
+func nextCheckinTime(cfg checkinSettings) string {
+	if !cfg.Enabled {
+		return ""
+	}
+	now := time.Now()
+	target := time.Date(now.Year(), now.Month(), now.Day(), clampHour(cfg.Hour), clampMinute(cfg.Minute), 0, 0, now.Location())
+	if !target.After(now) {
+		target = target.Add(24 * time.Hour)
+	}
+	return target.Format(time.RFC3339)
+}
+
+// clearHistory drops the recorded runs and reports how many went.
+//
+// The schedule's own bookkeeping — the date of the last automatic run — is left alone:
+// clearing a display list must not make the scheduler think today's run never happened
+// and fire it a second time.
+func (s *checkinState) clearHistory() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(s.history)
+	s.history = nil
+	return n
+}
+
+// domainSaysInternational reports whether a domain positively names the international realm.
+//
+// Separate from variantOfDomain, which answers a different question: that one maps a domain
+// onto the realm to *use*, and falls back to international for anything it does not
+// recognise — the right default when choosing an endpoint, the wrong one when deciding
+// whether an account is eligible for an operation. An empty or unknown domain is not
+// evidence of international; only the known hosts are.
+func domainSaysInternational(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	if d == "" {
+		return false
+	}
+	switch {
+	case strings.Contains(d, "codebuddy.cn"), strings.Contains(d, "copilot.tencent.com"):
+		return false
+	case strings.Contains(d, "workbuddy.ai"), strings.Contains(d, "codebuddy.ai"):
+		return true
+	}
+	return false
+}
+
+// allAccountsInternational reports whether every credential belongs to the international
+// realm.
+//
+// Used to name the reason a check-in pass had nothing to do: a pool that is entirely
+// international is not missing anything, the operation simply does not exist there.
+func allAccountsInternational(accounts []checkinAccount) bool {
+	if len(accounts) == 0 {
+		return false
+	}
+	for _, account := range accounts {
+		if account.Creds == nil {
+			return false
+		}
+		if !domainSaysInternational(account.Creds.Domain) {
+			return false
+		}
+	}
+	return true
+}
+
+// runCheckinForAccount checks in one account, the one a row's 签到 button names.
+//
+// An international account is answered with an explicit skip rather than being looked
+// up in the check-in list: that list leaves international credentials out altogether,
+// so a lookup would only say "not found", which reads like a fault.
+func runCheckinForAccount(uid string) *checkinRun {
+	run := &checkinRun{StartedAt: nowPanel(), Trigger: "manual"}
+	finish := func(res checkinResult) *checkinRun {
+		run.Total = 1
+		switch {
+		case res.Skipped:
+			run.Skipped = 1
+		case res.Success && res.Error == "":
+			run.Succeeded = 1
+		default:
+			run.Failed = 1
+		}
+		run.Results = []checkinResult{res}
+		run.FinishedAt = nowPanel()
+		state.checkin.record(run)
+		return run
+	}
+
+	for _, a := range listWorkBuddyAccounts() {
+		if a.UID != uid && a.AuthIndex != uid {
+			continue
+		}
+		if a.Variant == string(variantAi) {
+			return finish(checkinResult{
+				AuthID: a.AuthIndex, Label: a.Label, UID: a.UID, Domain: a.Domain,
+				Skipped: true, Message: "国际版无签到功能", CheckedAt: time.Now(),
+			})
+		}
+		break
+	}
+
+	state.checkin.mu.Lock()
+	if state.checkin.running {
+		state.checkin.mu.Unlock()
+		return finish(checkinResult{UID: uid, Error: "已有签到任务正在运行"})
+	}
+	state.checkin.running = true
+	state.checkin.mu.Unlock()
+	defer func() {
+		state.checkin.mu.Lock()
+		state.checkin.running = false
+		state.checkin.mu.Unlock()
+	}()
+
+	accounts, errCollect := collectCheckinAccounts()
+	if errCollect != nil {
+		return finish(checkinResult{UID: uid, Error: "读取账号失败：" + errCollect.Error()})
+	}
+	for _, account := range accounts {
+		if account.AuthID != uid && (account.Creds == nil || account.Creds.UID != uid) {
+			continue
+		}
+		return finish(checkinOne(account, state.settings.get().Checkin))
+	}
+	return finish(checkinResult{UID: uid, Error: "账号不存在、已停用或不支持签到"})
+}

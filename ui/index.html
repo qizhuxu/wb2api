@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wb2api 管理台</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="side" id="side">
+    <div class="brand">
+      <div class="logo">W</div>
+      <div class="bt"><b>wb2api</b><span>管理台 · v<span id="brand-ver">—</span></span></div>
+      <button class="ghost icon only-narrow" id="btn-close-nav" title="收起导航" aria-label="收起导航">✕</button>
+    </div>
+
+    <nav class="nav" id="nav" aria-label="主导航">
+      <a href="#/overview" data-view="overview" class="active">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></svg>
+        总览</a>
+      <a href="#/models" data-view="models">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        模型</a>
+      <a href="#/creds" data-view="creds">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 2a5 5 0 0 1 5 5v2h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2h2V7a5 5 0 0 1 5-5z"/><circle cx="12" cy="15" r="2"/></svg>
+        凭证</a>
+      <a href="#/selfcheck" data-view="selfcheck">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+        自检</a>
+      <a href="#/danger" data-view="danger">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.9 18a2 2 0 0 0 1.7 3h16.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+        危险操作</a>
+    </nav>
+
+    <div class="side-note">
+      本服务<b>没有鉴权</b>，只监听回环地址。<br>
+      请勿把端口暴露到公网或局域网。
+    </div>
+
+    <div class="foot">
+      <span class="pill" id="svc-pill" title="点「刷新数据」重新探测"><i class="dot" id="svc-dot"></i><span id="svc-text">连接中…</span></span>
+      <button class="ghost icon" id="btn-theme" title="主题：跟随系统 / 浅色 / 深色" aria-label="切换主题">🌓</button>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim" hidden></div>
+
+  <main class="main">
+    <header class="top">
+      <button class="ghost icon only-narrow" id="btn-open-nav" title="打开导航" aria-label="打开导航">☰</button>
+      <div class="ttl">
+        <h1 id="page-title">总览</h1>
+        <div class="sub" id="page-sub">凭证状态、模型数与服务版本</div>
+      </div>
+      <div class="top-actions">
+        <label class="autoref"><input type="checkbox" id="auto-refresh"> 自动刷新 <span class="dim">(30s)</span></label>
+        <span class="dim mono last-upd" id="last-updated">—</span>
+        <button class="primary" id="btn-refresh">刷新数据</button>
+      </div>
+    </header>
+
+    <div id="banners" class="banners"></div>
+
+    <!-- ==================== 总览 ==================== -->
+    <section id="view-overview" class="view" data-title="总览" data-sub="凭证状态、模型数与服务版本">
+      <div class="grid g4">
+        <div class="card kpi">
+          <div class="k-head"><span class="k-label">凭证状态</span><span class="k-ic" id="ov-ic">♥</span></div>
+          <div class="k-val" id="ov-state">—</div>
+          <div class="k-sub" id="ov-state-sub">—</div>
+        </div>
+        <div class="card kpi">
+          <div class="k-head"><span class="k-label">可用模型</span><span class="k-ic">▦</span></div>
+          <div class="k-val" id="ov-models">—</div>
+          <div class="k-sub" id="ov-models-sub">—</div>
+        </div>
+        <div class="card kpi">
+          <div class="k-head"><span class="k-label">服务版本</span><span class="k-ic">◈</span></div>
+          <div class="k-val" id="ov-ver">—</div>
+          <div class="k-sub" id="ov-ver-sub">—</div>
+        </div>
+        <div class="card kpi">
+          <div class="k-head"><span class="k-label">access token 剩余</span><span class="k-ic">◔</span></div>
+          <div class="k-val" id="ov-ttl">—</div>
+          <div class="k-sub" id="ov-ttl-sub">—</div>
+        </div>
+      </div>
+
+      <div class="grid g2 mt">
+        <div class="card">
+          <h3>账号与凭证</h3>
+          <div class="kv" id="ov-creds"><span class="dim">加载中…</span></div>
+        </div>
+        <div class="card">
+          <h3>上游与服务</h3>
+          <div class="kv" id="ov-svc"><span class="dim">加载中…</span></div>
+        </div>
+      </div>
+
+      <div class="card mt">
+        <h3>客户端接法 <span class="dim small">api_key 随便填，本服务不校验</span></h3>
+        <pre id="ov-snippet">加载中…</pre>
+        <div class="row-actions" style="margin-bottom:0">
+          <button id="btn-copy-base">复制 base_url</button>
+          <button id="btn-copy-snippet">复制示例代码</button>
+          <span class="dim small" id="copy-msg"></span>
+        </div>
+      </div>
+
+      <div class="card mt">
+        <h3>端点速查</h3>
+        <div class="tbl-wrap">
+          <table class="list">
+            <thead><tr><th>方法</th><th>路径</th><th>说明</th></tr></thead>
+            <tbody id="ov-endpoints"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card mt">
+        <h3>模型来源分布</h3>
+        <div id="ov-dist"><span class="dim">加载中…</span></div>
+        <p class="dim small" style="margin:10px 0 0">
+          <code>local</code> = WorkBuddy 本地产品配置（桌面端同源，字段最全）；
+          <code>upstream</code> = 上游 <code>/v3/config</code> 下发；
+          <code>probe</code> = 两个目录都没有、靠探活确认可路由。
+        </p>
+      </div>
+    </section>
+
+    <!-- ==================== 模型 ==================== -->
+    <section id="view-models" class="view hidden" data-title="模型" data-sub="GET /v1/models 的完整目录">
+      <div class="card">
+        <div class="row-actions" style="margin-top:0">
+          <input type="search" id="m-q" placeholder="按 id / 名称 / 厂商标识筛选…" autocomplete="off">
+          <label>来源
+            <select id="m-src">
+              <option value="">全部</option>
+              <option value="local">local（本地产品配置）</option>
+              <option value="upstream">upstream（上游 /v3/config）</option>
+              <option value="probe">probe（探活兜底）</option>
+            </select>
+          </label>
+          <button id="m-clear">清空筛选</button>
+          <label class="chk"><input type="checkbox" id="m-only-img"> 仅看支持图片</label>
+          <label class="chk"><input type="checkbox" id="m-only-tool"> 仅看支持工具</label>
+          <span class="spacer"></span>
+          <button id="btn-models-refresh" title="带 refresh 参数，服务端会重新拉目录并重探兜底模型">强制重拉目录</button>
+        </div>
+        <div class="dim small" id="m-stat">加载中…</div>
+        <div class="tbl-wrap mt-s">
+          <table class="list" id="m-table">
+            <thead>
+              <tr>
+                <th class="sortable" data-sort="id">id</th>
+                <th class="sortable" data-sort="name">名称</th>
+                <th class="sortable" data-sort="catalog">来源</th>
+                <th class="sortable num" data-sort="context_length">context_length</th>
+                <th class="sortable num" data-sort="max_output_tokens">max_output_tokens</th>
+                <th>supports</th>
+                <th class="sortable" data-sort="owned_by">owned_by</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody id="m-tbody"><tr><td colspan="8" class="dim">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 凭证 ==================== -->
+    <section id="view-creds" class="view hidden" data-title="凭证" data-sub="当前会话凭证与两种续期方式">
+      <div class="card">
+        <h3>当前凭证</h3>
+        <div class="kv" id="c-detail"><span class="dim">加载中…</span></div>
+        <div class="row-actions" style="margin-bottom:0">
+          <button id="btn-creds-file">重新解凭证（mode=file）</button>
+          <button id="btn-creds-token">换票续期（mode=token）</button>
+          <button id="btn-creds-reload">仅刷新显示</button>
+        </div>
+        <p class="dim small" style="margin:12px 0 0">
+          <b>重新解凭证</b>：<code>POST /__wb2api/creds/refresh</code>（默认 <code>mode=file</code>）——
+          从本机 WorkBuddy 加密会话文件重新解密一份凭证，需要本机装过并登录过 WorkBuddy。
+          成功后模型目录缓存会被作废，页面会自动重拉。
+        </p>
+        <p class="dim small" style="margin:8px 0 0">
+          <b>换票续期</b>：<code>POST /__wb2api/creds/refresh?mode=token</code>——
+          用当前 refreshToken 找上游换一张新的 accessToken，不碰桌面端文件。
+          refreshToken 是<b>会轮换</b>的，本服务内部已做并发去重。
+        </p>
+      </div>
+
+      <div class="card mt">
+        <h3>凭证来源与到期</h3>
+        <div class="grid g3">
+          <div class="mini"><div class="m-l">来源</div><div class="m-v mono" id="c-src">—</div></div>
+          <div class="mini"><div class="m-l">access token 到期</div><div class="m-v mono" id="c-exp">—</div></div>
+          <div class="mini"><div class="m-l">refresh token 到期</div><div class="m-v mono" id="c-rexp">—</div></div>
+        </div>
+        <p class="dim small" style="margin:12px 0 0">
+          来源取值：<code>file</code> = 从本机加密会话文件解密；<code>cache</code> = 复用 <code>data/wb-session.json</code>；
+          <code>file+refresh</code> / <code>cache+refresh</code> = 在上面的基础上又换过一次票。
+          服务会在 accessToken 剩余有效期低于 <code>credentials.refreshBeforeSec</code> 时自动续期。
+        </p>
+      </div>
+    </section>
+
+    <!-- ==================== 自检 ==================== -->
+    <section id="view-selfcheck" class="view hidden" data-title="自检" data-sub="GET /__wb2api 的完整结果">
+      <div class="card">
+        <div class="row-actions" style="margin-top:0">
+          <button id="btn-sc-reload">重新拉取自检</button>
+          <button id="btn-sc-copy">复制 JSON</button>
+          <a class="btn-like" href="/__wb2api" target="_blank" rel="noopener">在新标签打开原始 JSON</a>
+          <span class="dim small" id="sc-msg"></span>
+        </div>
+        <div class="kv" id="sc-keyvals"></div>
+      </div>
+      <div class="card mt">
+        <h3>原始 JSON</h3>
+        <pre id="sc-json">加载中…</pre>
+      </div>
+    </section>
+
+    <!-- ==================== 危险操作 ==================== -->
+    <section id="view-danger" class="view hidden" data-title="危险操作" data-sub="会让服务退出的操作，需二次确认">
+      <div class="card danger-card">
+        <h3>关闭服务（POST /__wb2api/shutdown）</h3>
+        <p class="dim small" style="margin-top:0">
+          请求成功后服务会在约 50ms 内 <code>process.exit(0)</code>。正在进行的对话会被中断。
+          服务<b>不会自动重启</b>，需要在项目目录执行 <code>npm start</code>。
+        </p>
+        <ul class="dim small">
+          <li>服务端只接受来自本机（<code>127.0.0.1</code> / <code>::1</code>）的请求；</li>
+          <li>带 <code>Origin</code> 头的浏览器请求会被拒绝（服务端防 CSRF 的既有设计）——所以在浏览器里点这个按钮，服务端会回 <code>403 origin not allowed</code>，这是<b>预期行为</b>，请改用 <code>npm run stop</code>。</li>
+        </ul>
+        <div class="row-actions">
+          <button class="danger" id="btn-shutdown">关闭服务…</button>
+          <span class="dim small">需要连续两次确认</span>
+        </div>
+      </div>
+
+      <div class="card mt">
+        <h3>本次会话操作记录</h3>
+        <div class="tbl-wrap">
+          <table class="list">
+            <thead><tr><th>时间</th><th>操作</th><th>结果</th><th>详情</th></tr></thead>
+            <tbody id="d-log"><tr><td colspan="4" class="dim">还没有操作记录</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 二次确认对话框 -->
+<div class="overlay hidden" id="confirm">
+  <div class="card dialog" role="dialog" aria-modal="true" aria-labelledby="cf-title">
+    <h2 id="cf-title">确认</h2>
+    <p class="dim" id="cf-text" style="margin-top:0"></p>
+    <div id="cf-extra"></div>
+    <label class="checkline" id="cf-checkline">
+      <input type="checkbox" id="cf-check"> 我已了解后果，继续
+    </label>
+    <div class="row-actions" style="margin-bottom:0">
+      <button class="danger" id="cf-ok" disabled>确认执行</button>
+      <button id="cf-cancel">取消</button>
+      <span class="dim small" id="cf-tip"></span>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" aria-live="polite"></div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

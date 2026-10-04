@@ -1,0 +1,18 @@
+# 公开面隔离（§5.4）
+#
+# 本地仓库完整保留一切；带 export-ignore 的路径不会进入
+# `git archive` 导出的归档（GitHub 的 "Download ZIP" 同理）。
+#
+# 规范原文（§5.4）：公开仓库只保留「构建/运行必要的源码」与「必要介绍文档」，
+# 开发资料（本规范、测试脚本、内部调查报告等）不入公开仓库；**本文档不得公开**。对应关系：
+#   - AGENTS.md              **本文档不得公开**
+#   - test/                  回归测试脚本（开发资料）
+#   - docs/architecture.md   内部调查报告（含上游踩坑记录与实测数据）
+#   - scripts/probe.mjs      自检脚本，含本机账号探测逻辑（开发资料）
+#
+# 注意：这些规则**不影响** git clone / git checkout —— 本地与私有远端一切照旧。
+# 导出并自检：npm run public-snapshot
+AGENTS.md           export-ignore
+test/               export-ignore
+docs/               export-ignore
+scripts/probe.mjs   export-ignore

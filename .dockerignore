@@ -1,0 +1,40 @@
+# docker build 上下文排除项（只影响构建，不影响 git）
+#
+# 目标：镜像里只留「构建/运行必需」的东西 —— 与 §5.4 公开面同样的纪律。
+
+# 依赖与产物（容器内会 npm ci 重装）
+node_modules
+
+# 运行时产物：密钥与会话缓存，绝不能进镜像层
+data/
+logs/
+*.log
+
+# 开发资料（同 .gitattributes 的 export-ignore）
+AGENTS.md
+CLAUDE.md
+test/
+docs/
+scripts/
+.github/
+
+# 第三方参考源码（体量大且与运行无关）
+CPA/
+cpa-plugin/
+cpa-plugin2/
+dsh-plugin/
+
+# 版本控制与编辑器
+.git
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 其它
+menu.mjs
+start.bat
+*.md
+!README.md

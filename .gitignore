@@ -1,0 +1,32 @@
+node_modules/
+data/
+logs/
+*.log
+.at-rest-key.*.tmp
+
+# cpa-plugin（Go 二开）构建产物
+cpa-plugin/dist/
+cpa-plugin/smoke/smoke
+cpa-plugin/*.so
+cpa-plugin/*.h
+cpa-plugin/go.work
+cpa-plugin/go.work.sum
+
+# cpa-plugin2（codebuddy-intl-cpa，Go 二开）构建产物
+cpa-plugin2/**/dist/
+cpa-plugin2/*.so
+cpa-plugin2/*.h
+cpa-plugin2/go.work
+cpa-plugin2/go.work.sum
+
+# CPA/：CLIProxyAPI 上游参考源码（只读调研用，不入库）
+# 保留其自带 .git，便于 `git -C CPA pull` 跟进新版本。
+CPA/
+
+# cpa-plugin2/：codebuddy-intl-cpa 第三方插件（二开基线，不入库）
+# 保留其自带 .git，便于 `git -C cpa-plugin2 pull` 跟进新版本。
+cpa-plugin2/
+
+# dsh-plugin/：DSH-Official-WorkBuddy-Credit-Proxy 第三方插件（参考，不入库）
+# 保留其自带 .git，便于 `git -C dsh-plugin pull` 跟进新版本。
+dsh-plugin/

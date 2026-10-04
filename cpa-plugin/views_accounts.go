@@ -1,0 +1,515 @@
+package main
+
+// The account pool's table, its filter bar, and the routing box.
+//
+// Kept apart from main_page.go so the page frame stays readable: the frame says
+// which blocks a page has, and this file says what the pool block contains.
+
+import (
+	"fmt"
+	"html"
+	"strings"
+	"time"
+)
+
+// renderAccountFilterBar is the strip above the pool table.
+//
+// Filtering happens in the browser because the rows are already in the document: a
+// round trip per keystroke would be slower and would steal the focus the operator is
+// typing into.
+func renderAccountFilterBar() string {
+	var b strings.Builder
+	b.WriteString(`<div class="filter-bar">`)
+	b.WriteString(`<span class="filter-search">`)
+	b.WriteString(`<svg class="filter-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">` +
+		`<circle cx="7" cy="7" r="4.4" fill="none" stroke="currentColor" stroke-width="1.7"/>` +
+		`<path d="M10.4 10.4L14 14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>`)
+	b.WriteString(`<input type="search" id="accountFilter" placeholder="搜索账号或备注" autocomplete="off">`)
+	b.WriteString(`<button type="button" class="filter-clear" id="accountFilterClear" title="清除" aria-label="清除搜索" hidden>` +
+		`<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">` +
+		`<path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>` +
+		`</button>`)
+	b.WriteString(`</span>`)
+	b.WriteString(`<select id="accountStatusFilter" aria-label="按状态筛选">`)
+	for _, option := range []struct{ value, label string }{
+		{"", "全部状态"},
+		{"usable", "仅可用"},
+		{"cooling", "仅冷却中"},
+		{"disabled", "仅已停用"},
+		{"expired", "仅凭据异常"},
+	} {
+		b.WriteString(`<option value="` + option.value + `">` + option.label + `</option>`)
+	}
+	b.WriteString(`</select>`)
+	b.WriteString(`<span class="filter-count" id="accountFilterCount"></span>`)
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+// accountCallStats returns how many calls an account has served and how many failed.
+//
+// Counted from the call history rather than tracked separately: the history already
+// records every request with its account and outcome, and a second counter would have to
+// be kept in step with it. The window is the same as the usage page shows.
+//
+// Records carry whichever identifier was available when they were written — the
+// credential's uid once the executor started stamping responses, CPA's auth index before
+// that — so both sides are normalised before comparing. Without it, a call served
+// yesterday is invisible to the account it belongs to and the tally reads 0/0.
+func accountCallStats(uid string) (success, failed int) {
+	if uid == "" {
+		return 0, 0
+	}
+	// The account's own identifiers, plus its canonical form: a record may name it by
+	// the uid, by the auth index on the credential, or by CPA's runtime auth id.
+	wanted := map[string]bool{uid: true}
+	if canon := canonicalUID(uid); canon != "" {
+		wanted[canon] = true
+	}
+	if key := state.pool.authIndexFor(uid); key != "" {
+		wanted[key] = true
+	}
+
+	for _, rec := range state.log.recent(500) {
+		if !recordMatchesAccount(rec, wanted) {
+			continue
+		}
+		if rec.Notice {
+			// Not a call.
+			continue
+		}
+		// recordFailed excludes a caller hanging up, which is not the account's fault.
+		if recordFailed(rec) {
+			failed++
+			continue
+		}
+		if rec.StatusCode >= 400 || rec.Error != "" {
+			// A failure that recordFailed does not count — a client abort. It is not a
+			// success either, so it stays out of both columns.
+			continue
+		}
+		success++
+	}
+	return success, failed
+}
+
+// recordMatchesAccount reports whether a record belongs to any of the given identifiers.
+func recordMatchesAccount(rec callRecord, wanted map[string]bool) bool {
+	for _, candidate := range []string{rec.UID, canonicalUID(rec.UID)} {
+		if candidate != "" && wanted[candidate] {
+			return true
+		}
+	}
+	// The label is a fallback for records written before the executor stamped
+	// identifiers: it holds the display name, which is what the account row shows.
+	return rec.Label != "" && wanted[rec.Label]
+}
+
+// renderAccountTable draws the pool.
+//
+// Columns: the account, its state, the credit ratio with a bar, the call tally, and
+// the row's own controls. The uid sits under the name in small type — it is an
+// identifier, not a column the operator scans by.
+//
+// 在途 / 用量 / 最近成功 were dropped at the operator's request: they answered
+// questions nobody was asking in this table, and each cost a column of width that the
+// remaining ones can use.
+func renderAccountTable(accounts []workBuddyAccount) string {
+	var b strings.Builder
+	b.WriteString(`<div class="tbl-wrap"><table class="accounts" data-account-table="1"><thead><tr>`)
+	b.WriteString(`<th>账号</th><th>区域</th><th>状态</th><th class="num">积分</th>`)
+	b.WriteString(`<th class="num">成功 / 失败</th><th class="actions">操作</th>`)
+	b.WriteString(`</tr></thead><tbody>`)
+
+	for _, a := range accounts {
+		b.WriteString(renderAccountRow(a))
+	}
+
+	b.WriteString(`</tbody></table></div>`)
+	return b.String()
+}
+
+// renderAccountRow draws one account.
+func renderAccountRow(a workBuddyAccount) string {
+	pillClass, statusText := "ok", "可用"
+	detail := ""
+	switch {
+	case a.AutoDisabled:
+		// Distinguished from a manual disable so the operator knows the pool retired
+		// it and can re-enable deliberately.
+		pillClass, statusText = "bad", "自动禁用"
+		detail = firstNonEmpty(a.DisabledReason, a.Reason)
+	case a.DisabledByUser || a.Disabled:
+		pillClass, statusText = "idle", "已停用"
+		detail = firstNonEmpty(a.DisabledReason, a.Reason)
+	case a.Expired:
+		pillClass, statusText = "bad", "凭据异常"
+		detail = a.Reason
+	case !a.CooldownUntil.IsZero() && time.Now().Before(a.CooldownUntil):
+		pillClass, statusText = "warn", "冷却中"
+		detail = "至 " + a.CooldownUntil.In(panelLocation).Format("15:04")
+	}
+
+	ident := firstNonEmpty(a.UID, a.AuthIndex)
+
+	// Health tone for the strip on the first cell: green serving, amber parked,
+	// red retired.
+	bar := "ok"
+	switch {
+	case a.AutoDisabled || a.Disabled || a.DisabledByUser || a.Expired:
+		bar = "bad"
+	case !a.CooldownUntil.IsZero() && time.Now().Before(a.CooldownUntil):
+		bar = "warn"
+	}
+
+	filterStatus := "usable"
+	switch {
+	case a.AutoDisabled || a.DisabledByUser || a.Disabled:
+		filterStatus = "disabled"
+	case a.Expired || a.CreditsExpired:
+		filterStatus = "expired"
+	case !a.CooldownUntil.IsZero() && time.Now().Before(a.CooldownUntil):
+		filterStatus = "cooling"
+	}
+
+	searchText := strings.Join([]string{
+		a.Label, a.UID, a.AuthIndex, a.Variant, a.DisabledReason, a.Reason, statusText,
+	}, " ")
+
+	rowAction, rowActionLabel := "disable", "禁用"
+	if a.DisabledByUser || a.Disabled || a.AutoDisabled {
+		rowAction, rowActionLabel = "enable", "启用"
+	}
+
+	var b strings.Builder
+	b.WriteString(`<tr data-status="` + filterStatus + `" data-search="` + html.EscapeString(searchText) + `">`)
+
+	// Name with the uid abbreviated underneath.
+	b.WriteString(`<td class="bar ` + bar + `" data-label="账号">`)
+	// The label is "WorkBuddy <uuid>" — a name and an identifier. Split for display: the
+	// name on the first line, the identifier beneath it. On one line the pair is 46
+	// characters, which no sane column width holds, and clipping it mid-uuid is worse
+	// than useless because two accounts then look identical up to the cut.
+	displayName, identifier := splitAccountLabel(a.Label, ident)
+	b.WriteString(`<div class="acct-name"><strong>` + html.EscapeString(displayName) + `</strong>`)
+	if identifier != "" {
+		b.WriteString(`<span class="uid mono" title="` + html.EscapeString(identifier) + `">` +
+			html.EscapeString(identifier) + `</span>`)
+	}
+	b.WriteString(`</div>`)
+	b.WriteString(`</td>`)
+
+	// Realm, in its own cell.
+	b.WriteString(`<td data-label="区域">` + variantBadge(a.Variant) + `</td>`)
+
+	b.WriteString(`<td data-label="状态"><span class="pill ` + pillClass + `">` + statusText + `</span>`)
+	if detail != "" {
+		b.WriteString(`<div class="uid">` + html.EscapeString(detail) + `</div>`)
+	}
+	b.WriteString(`</td>`)
+
+	b.WriteString(renderCreditsCell(a, ident))
+
+	success, failed := accountCallStats(ident)
+	b.WriteString(`<td class="num mono" data-label="成功 / 失败">` +
+		fmt.Sprint(success) + ` <span class="sep">/</span> ` +
+		`<span class="` + map[bool]string{true: "bad-text", false: ""}[failed > 0] + `">` +
+		fmt.Sprint(failed) + `</span></td>`)
+
+	// Row controls: sign in, refresh this account's balance, run its tasks, disable.
+	b.WriteString(`<td class="actions">`)
+	// International accounts have no check-in endpoint; the button is shown disabled
+	// with the reason instead of offering an action that cannot happen.
+	if a.Variant == string(variantAi) {
+		b.WriteString(`<button type="button" class="xs" disabled title="国际版无签到功能">签到</button>`)
+	} else {
+		b.WriteString(`<button type="button" class="xs" data-row-action="checkin" data-uid="` +
+			html.EscapeString(ident) + `">签到</button>`)
+	}
+	// International accounts have no growth task centre either, so their 任务 button is
+	// disabled the same way. It sits before 余额 so the two realm-only actions are adjacent.
+	if a.Variant == string(variantAi) {
+		b.WriteString(`<button type="button" class="xs" disabled title="国际版无任务功能">任务</button>`)
+	} else {
+		b.WriteString(`<button type="button" class="xs" data-row-action="tasks" data-uid="` +
+			html.EscapeString(ident) + `">任务</button>`)
+	}
+	b.WriteString(`<button type="button" class="xs" data-row-action="quota" data-uid="` +
+		html.EscapeString(ident) + `">余额</button>`)
+	b.WriteString(`<button type="button" class="xs ` +
+		map[bool]string{true: "danger", false: ""}[rowAction == "disable"] + `"` +
+		` data-account-toggle="1" data-uid="` + html.EscapeString(ident) + `"` +
+		` data-action="` + rowAction + `" data-auth-index="` + html.EscapeString(a.AuthIndex) + `">` +
+		rowActionLabel + `</button>`)
+	b.WriteString(`</td>`)
+	b.WriteString(`</tr>`)
+	return b.String()
+}
+
+// variantBadge renders the realm an account belongs to.
+//
+// Shown next to the account name on every list that names an account, because the realm
+// decides what the account can do: growth tasks and check-in only exist for domestic
+// accounts. It used to appear only on the tasks page, and there it printed the raw
+// value ("cn" / "ai") rather than a word.
+func variantBadge(variant string) string {
+	label, cls := variantBadgeText(variant)
+	if label == "" {
+		return ""
+	}
+	return `<span class="tag ` + cls + `">` + label + `</span>`
+}
+
+// variantBadgeText maps a realm to its display label and tone.
+func variantBadgeText(variant string) (string, string) {
+	switch strings.TrimSpace(variant) {
+	case string(variantAi):
+		return "国际", "tag-ai"
+	case string(variantCn):
+		return "国内", "tag-cn"
+	default:
+		// An account whose realm has not been recorded yet. Saying so is better than
+		// guessing: the runner treats it as domestic, but that is a default, not a fact.
+		return "未标注", "tag-unknown"
+	}
+}
+
+// renderCreditsCell draws the balance as "remaining / total" over a progress bar.
+//
+// The ratio is what makes the number readable: 3735 alone says nothing, 3735 / 4600
+// says four fifths of the cycle is still available. When the upstream reported no
+// capacity there is nothing to divide by, so the bare remainder is shown instead.
+func renderCreditsCell(a workBuddyAccount, ident string) string {
+	var b strings.Builder
+	b.WriteString(`<td data-label="积分" data-credits-for="` + html.EscapeString(ident) + `">`)
+
+	if !a.CreditsKnown {
+		b.WriteString(`<span class="uid">—</span></td>`)
+		return b.String()
+	}
+
+	if a.CreditsTotal > 0 {
+		pct := float64(a.Credits) / float64(a.CreditsTotal) * 100
+		if pct < 0 {
+			pct = 0
+		}
+		if pct > 100 {
+			pct = 100
+		}
+		tone := "ok"
+		switch {
+		case pct <= 10:
+			tone = "bad"
+		case pct <= 30:
+			tone = "warn"
+		}
+		b.WriteString(`<span class="credit-ratio mono"><span class="credit-remaining ` + tone + `">` +
+			fmt.Sprint(a.Credits) + `</span><span class="credit-total uid"> / ` + fmt.Sprint(a.CreditsTotal) +
+			`</span></span>`)
+		b.WriteString(`<div class="credit-bar"><span class="` + tone + `" style="width:` +
+			fmt.Sprintf("%.1f", pct) + `%"></span></div>`)
+	} else {
+		b.WriteString(`<span class="credit-ratio mono">` + fmt.Sprint(a.Credits) + `</span>`)
+	}
+
+	if a.CreditsExpired {
+		b.WriteString(`<div class="uid bad-text">已过期</div>`)
+	} else if a.CreditsExpiringSoon && a.CreditsExpireDays > 0 {
+		b.WriteString(`<div class="uid warn-text">` + fmt.Sprint(a.CreditsExpireDays) + ` 天后过期</div>`)
+	}
+	b.WriteString(`</td>`)
+	return b.String()
+}
+
+// splitAccountLabel separates a display name from its identifier.
+//
+// Credentials are labelled "WorkBuddy <uuid>" by the host inventory. The prefix carries
+// no information when every row has it, and the uuid is what distinguishes one account
+// from another — so the two are rendered on separate lines: the name reads as a heading,
+// the identifier as the detail.
+func splitAccountLabel(label, ident string) (name, identifier string) {
+	label = strings.TrimSpace(label)
+	ident = strings.TrimSpace(ident)
+
+	// A label of the form "<prefix> <uuid>" where the uuid is the credential id.
+	if parts := strings.Fields(label); len(parts) >= 2 {
+		last := parts[len(parts)-1]
+		if last == ident || looksLikeUID(last) {
+			return strings.Join(parts[:len(parts)-1], " "), last
+		}
+	}
+	// A bare uuid as the label.
+	if looksLikeUID(label) {
+		return firstNonEmpty(shortenUID(label), label), ""
+	}
+	if ident != "" && ident != label {
+		return label, ident
+	}
+	return label, ""
+}
+
+// looksLikeUID reports whether a token has the shape of a credential identifier —
+// a hex-and-dash uuid, which is what the host uses.
+func looksLikeUID(token string) bool {
+	if len(token) < 32 {
+		return false
+	}
+	dashes := 0
+	for _, r := range token {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+		case r == '-':
+			dashes++
+		default:
+			return false
+		}
+	}
+	return dashes >= 4
+}
+
+// shortenUID trims a long identifier for display, keeping both ends so it is still
+// recognisable against the full value shown on hover.
+func shortenUID(uid string) string {
+	if len(uid) <= 22 {
+		return uid
+	}
+	return uid[:12] + "…" + uid[len(uid)-6:]
+}
+
+// renderVariantBox draws the two supplier settings.
+//
+// They are shown as two separate groups rather than two rows of identical segmented
+// buttons. Both are "pick one of three", so without a structural break the eye reads
+// them as one question asked twice — and the two really are different: one decides
+// which credentials serve a call, the other which realm a new authorisation belongs to.
+func renderVariantBox(settings gatewaySettings) string {
+	var b strings.Builder
+	b.WriteString(`<div class="box supplier-card">`)
+	b.WriteString(`<header><h3>供应商 <span class="hint">调用与新授权各自归属哪个区域</span></h3><span class="grow"></span>`)
+	b.WriteString(`<span class="note" id="variantMsg"></span>`)
+	// A second slot: each group reports its own outcome, so a message from one does not
+	// overwrite the other's.
+	b.WriteString(`<span class="note" id="authMsg"></span>`)
+	b.WriteString(`</header>`)
+
+	// ---- what calls use ----
+	b.WriteString(`<div class="setting-group">`)
+	b.WriteString(`<div class="setting-label">`)
+	b.WriteString(`<span class="name">调用时使用哪些账号</span>`)
+	b.WriteString(`<span class="desc">决定一次模型调用会拿到哪一组凭据。已登录的账号不受影响——它们只是被排除在调用之外。</span>`)
+	b.WriteString(`</div>`)
+	b.WriteString(`<div class="setting-control"><div class="seg" id="variantSeg">`)
+	for _, opt := range []struct{ v, value, label, title string }{
+		// The stored value for "all" is the empty string — that is what the settings
+		// field documents, and what the endpoint returns. The button carries the same
+		// value, so re-rendering finds a match; using "auto" here meant the round trip
+		// came back as "" and no option looked selected.
+		{"auto", "", "全部", "国内与国际账号都参与调用"},
+		{"cn", "cn", "仅国内", "只调用 codebuddy.cn 账号"},
+		{"ai", "ai", "仅国际", "只调用 workbuddy.ai 账号"},
+	} {
+		// data-value is what the highlight matches on; data-call only wires the click.
+		b.WriteString(`<button type="button" class="` +
+			map[bool]string{true: "on", false: ""}[opt.value == settings.VariantOverride] + `"` +
+			` data-value="` + opt.value + `"` +
+			` data-call="setVariant" data-arg0="` + opt.value + `" title="` + opt.title + `">` + opt.label + `</button>`)
+	}
+	b.WriteString(`</div>`)
+	// The consequence of the current choice, rewritten in place when it changes.
+	b.WriteString(`<div class="setting-effect" id="variantSegEffect"` +
+		` data-auto="当前：两组账号一起参与调用，按路由策略挑选。"` +
+		` data-cn="当前：只有国内账号会收到调用；国际账号即使已登录也不参与。成长任务同样只支持国内账号。"` +
+		` data-ai="当前：只有国际账号会收到调用；国内账号即使已登录也不参与。成长任务与签到需要国内账号，当前不可用。">` +
+		variantEffect(settings.VariantOverride) + `</div>`)
+	b.WriteString(`</div></div>`)
+
+	// ---- where new authorisations go ----
+	b.WriteString(`<div class="setting-group">`)
+	b.WriteString(`<div class="setting-label">`)
+	b.WriteString(`<span class="name">新增授权的归属</span>`)
+	b.WriteString(`<span class="desc">在 CPA 的 OAuth 登录页完成授权时，这个账号算国内还是国际。只影响新授权，不改变已有账号。</span>`)
+	b.WriteString(`</div>`)
+	b.WriteString(`<div class="setting-control"><div class="seg" id="authSeg">`)
+	for _, opt := range []struct{ v, label, title string }{
+		// Two options, not three. "Follow the call setting" was a third state that had to
+		// be reasoned about ("follow … which is currently …"), and the call setting is
+		// often "all", which has no realm — so the follow choice quietly resolved to
+		// domestic anyway. Naming the two realms directly says what will happen.
+		{"cn", "国内", "新授权记为 codebuddy.cn 账号"},
+		{"ai", "国际", "新授权记为 workbuddy.ai 账号"},
+	} {
+		b.WriteString(`<button type="button" class="` +
+			map[bool]string{true: "on", false: ""}[opt.v == authSupplierValue(settings.AuthSupplier)] + `"` +
+			` data-value="` + opt.v + `"` +
+			` data-call="setAuthSupplier" data-arg0="` + opt.v + `" title="` + opt.title + `">` + opt.label + `</button>`)
+	}
+	b.WriteString(`</div>`)
+	b.WriteString(`<div class="setting-effect" id="authSegEffect"` +
+		` data-cn="当前：新授权记为国内账号。"` +
+		` data-ai="当前：新授权记为国际账号。">` +
+		authSupplierEffect(settings.AuthSupplier, settings.VariantOverride) + `</div>`)
+	b.WriteString(`</div></div>`)
+
+	b.WriteString(`<div class="foot">`)
+	b.WriteString(`<span class="note">要同时使用两个供应商：先把「新增授权的归属」设为国内，去 CPA 完成一次授权；` +
+		`再设为国际，完成第二次；最后把「调用时使用哪些账号」保持为「全部」。</span>`)
+	b.WriteString(`</div>`)
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+// variantEffect spells out the current call-side choice.
+func variantEffect(variant string) string {
+	switch variant {
+	case "cn":
+		return `当前：只有国内账号会收到调用；国际账号即使已登录也不参与。成长任务同样只支持国内账号。`
+	case "ai":
+		return `当前：只有国际账号会收到调用；国内账号即使已登录也不参与。成长任务与签到需要国内账号，当前不可用。`
+	default:
+		return `当前：两组账号一起参与调用，按路由策略挑选。`
+	}
+}
+
+// authSupplierValue maps a stored authorisation choice onto one of the two realms.
+//
+// The setting used to accept "follow", meaning "use whatever the call setting uses".
+// That third state is gone from the UI, but a stored value of "follow" — or an empty
+// one, which is the field's default — must still resolve to something, and domestic is
+// where the follow case landed anyway when calls were set to "all".
+func authSupplierValue(stored string) string {
+	switch strings.TrimSpace(stored) {
+	case string(variantAi):
+		return string(variantAi)
+	default:
+		return string(variantCn)
+	}
+}
+
+// authSupplierEffect spells out the current authorisation-side choice.
+func authSupplierEffect(supplier, variant string) string {
+	switch authSupplierValue(supplier) {
+	case string(variantAi):
+		return `当前：新授权记为国际账号（workbuddy.ai）。`
+	default:
+		return `当前：新授权记为国内账号（codebuddy.cn）。`
+	}
+}
+
+// renderAccountSummary draws the stat cards above the account table.
+//
+// Extracted so the panel can repaint it together with the table: the counts it shows — how
+// many accounts are usable, how many are disabled — change with the same toggle that
+// changes the rows, and refreshing one without the other left the header contradicting the
+// list beneath it.
+func renderAccountSummary(accounts []workBuddyAccount) string {
+	total, usable, _, _ := accountSummary(accounts)
+	var b strings.Builder
+	b.WriteString(`<div class="stats" data-account-stats="1">`)
+	statCard(&b, "", "账号总数", total)
+	statCard(&b, "good", "可用", usable)
+	statCard(&b, "warn", "冷却中", accountCoolingCount(accounts))
+	statCard(&b, "bad", "已禁用", accountDisabledCount(accounts))
+	statCard(&b, "", "积分合计", accountCreditsTotal(accounts))
+	b.WriteString(`</div>`)
+	return b.String()
+}

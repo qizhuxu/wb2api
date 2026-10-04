@@ -1,0 +1,210 @@
+name: plugin
+
+# 构建 workbuddy CPA 插件的 Linux .so，打成插件商店能装的 zip，发 Release。
+#
+# 为什么必须走 CI：本机只有 MinGW（Windows 目标）gcc，没有 Linux 交叉工具链，
+# 而 c-shared 插件必须用目标平台的 C 工具链构建（详见 docs/plugin-build-ci.md）。
+#
+# 触发：推送 v* tag 或手动。产物供 Linux 服务器
+# /vol1/1000/docker/CPA/plugins 使用。
+#
+# tag 形状必须是 v0.2.0（不是 plugin-v0.2.0）：registry 的 release_tag 要能被
+# validate_registry.py 归一化成 version，而它只剥开头的 v/V。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  PLUGIN_ID: workbuddy
+  PLUGIN_NAME: WorkBuddy
+  PLUGIN_DIR: cpa-plugin
+
+jobs:
+  build:
+    name: build linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: ${{ env.PLUGIN_DIR }}/go.sum
+
+      # c-shared 需要 C 工具链
+      - name: Install C compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc build-essential
+
+      # 单测不需要 cgo（插件刻意把 cgo 隔离在 cabi.go，CGO_ENABLED=0 也能测）
+      - name: Unit tests
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: CGO_ENABLED=0 go test ./... -count=1
+
+      - name: go vet
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: CGO_ENABLED=0 go vet ./...
+
+      # 构建两份，用体积差验证 strip 的作用（见 docs/plugin-build-ci.md §二）
+      - name: Build .so (c-shared)
+        working-directory: ${{ env.PLUGIN_DIR }}
+        env:
+          CGO_ENABLED: "1"
+          CC: gcc
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -e
+          mkdir -p dist
+          # 不 strip（上游 CI 的做法）
+          go build -buildmode=c-shared -trimpath -o dist/${PLUGIN_ID}-unstripped.so .
+          # strip（xm2api 实测推荐；更小，且据其经验更易被加载）
+          go build -buildmode=c-shared -trimpath -ldflags "-s -w" -o dist/${PLUGIN_ID}.so .
+          echo "--- 体积对照 ---"
+          ls -l dist/*.so
+          echo "unstripped: $(stat -c%s dist/${PLUGIN_ID}-unstripped.so) bytes"
+          echo "stripped:   $(stat -c%s dist/${PLUGIN_ID}.so) bytes"
+
+      # 三条硬校验：架构、ABI 符号、能 dlopen
+      - name: Verify architecture and ABI symbols
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: |
+          set -e
+          echo "--- ELF 架构（必须是 x86-64）---"
+          readelf -h dist/${PLUGIN_ID}.so | grep Machine
+          readelf -h dist/${PLUGIN_ID}.so | grep -q "X86-64" || { echo "架构不对"; exit 1; }
+          echo "--- 导出的 ABI 符号 ---"
+          nm -D --defined-only dist/${PLUGIN_ID}.so | grep -i cliproxy || true
+          for sym in cliproxy_plugin_init cliproxyPluginCall cliproxyPluginFree cliproxyPluginShutdown; do
+            nm -D --defined-only dist/${PLUGIN_ID}.so | grep -q "$sym" || { echo "缺符号: $sym"; exit 1; }
+          done
+          echo "4 个 ABI 符号齐全"
+
+      - name: Smoke test (dlopen)
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: |
+          set -e
+          go build -o dist/smoke ./smoke
+          ./dist/smoke dist/${PLUGIN_ID}.so
+
+      - name: Validate registry.json
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: python3 scripts/validate_registry.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-linux-amd64
+          path: |
+            cpa-plugin/dist/${{ env.PLUGIN_ID }}.so
+            cpa-plugin/dist/${{ env.PLUGIN_ID }}-unstripped.so
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${{ github.ref_name }}"; V="${V#plugin-v}"; V="${V#v}"
+          else
+            V="0.0.0-dev.${{ github.run_number }}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "版本: $V"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # 打成商店能装的 zip：动态库必须在 zip 根目录，且只有一个
+      - name: Package zip + checksums
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          mkdir -p release stage
+          cp "dist/workbuddy-linux-amd64/${PLUGIN_ID}.so" "stage/${PLUGIN_ID}.so"
+          ZIP="${PLUGIN_ID}_${VERSION}_linux_amd64.zip"
+          (cd stage && zip -q "../release/${ZIP}" "${PLUGIN_ID}.so")
+          echo "--- zip 内容（必须只有根目录一个 .so）---"
+          unzip -l "release/${ZIP}"
+          COUNT=$(unzip -l "release/${ZIP}" | grep -c '\.so$' || true)
+          [ "$COUNT" = "1" ] || { echo "zip 里有 $COUNT 个 .so，必须恰好 1 个"; exit 1; }
+          unzip -l "release/${ZIP}" | grep -qE "^\s+[0-9]+.*  ${PLUGIN_ID}\.so$" || { echo "动态库不在 zip 根目录"; exit 1; }
+          (cd release && sha256sum *.zip > checksums.txt)
+          echo "--- checksums.txt ---"
+          cat release/checksums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release/
+
+  release:
+    needs: package
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          V="${{ github.ref_name }}"; V="${V#plugin-v}"; V="${V#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+
+      # registry.json 供 CPA 插件商店读取（schema_version 必须为 1 或 2）
+      #
+      # release_tag 必须能归一化到 version：校验脚本只剥开头的 v/V
+      # （cpa-plugin/scripts/validate_registry.py 的 normalize_version），
+      # 所以 tag 只能是 v0.2.0 这种形状 —— 早先这里写 "plugin-v${VERSION}"，
+      # 归一化后是 "plugin-v0.2.0" ≠ "0.2.0"，生成的 registry 永远过不了
+      # 自己的校验（已在 CI run#2 实测撞到）。
+      - name: Generate registry.json
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cat > registry.json <<EOF
+          {
+            "schema_version": 2,
+            "plugins": [
+              {
+                "id": "${PLUGIN_ID}",
+                "name": "${PLUGIN_NAME}",
+                "description": "把 WorkBuddy 账号反代为 CPA 的 OpenAI 兼容接口：账号轮换、模型输出、签到与积分管理。",
+                "author": "wb2api",
+                "version": "${VERSION}",
+                "release_tag": "v${VERSION}",
+                "repository": "${{ github.server_url }}/${{ github.repository }}",
+                "license": "MIT",
+                "install": { "type": "github-release" }
+              }
+            ]
+          }
+          EOF
+          python3 -c "import json;json.load(open('registry.json'))" && echo "registry.json 合法"
+
+      # 自检：生成的 registry 必须过仓库自己的校验脚本，
+      # 否则商店会以 "missing required field release-tag" 之类拒绝整份清单。
+      - name: Validate generated registry.json
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: python3 scripts/validate_registry.py
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.zip
+            release/checksums.txt
+            registry.json
+          generate_release_notes: true
